@@ -50,8 +50,22 @@ uv run plom mm BTC --profile hyperliquid --order-latency-ms 250 --queue-power 2
 uv run plom mm --help
 ```
 
-Output: position, PnL marked at mid, fills, **edge** (fill price vs mid at fill) and **markouts** (mid 1s / 5s after the fill vs fill price).
-Edge minus markout decay is the adverse selection. Ctrl+C prints a summary broken down per layer.
+Ctrl+C (or the end of a replay) prints an evaluation:
+
+- **PnL attribution**: PnL = spread capture (each fill's edge against the mid at fill time) + inventory PnL (the position marked through later mid moves) - fees. Exact, not estimated.
+- **Markouts** at 100ms, 1s, 5s, 30s, 1m and 5m: how far the mid moved in our favour after each fill, size-weighted, with the dollars of spread capture that survived to that horizon. Edge minus markout is adverse selection.
+- **Confidence**: PnL per hour and each markout get a 95% block-bootstrap interval. Fills cluster, so whole `--block-s` blocks of market time (default 300s) are resampled, not individual fills.
+- A breakdown of fills, edge and short markouts per layer and per regime.
+
+## Comparing configurations
+
+`plom compare` replays one recording under several configurations in parallel processes and ranks them. Each variant's PnL per hour is also compared with the profile's defaults block by block (a paired bootstrap), which separates real differences from market noise far better than comparing two totals.
+
+```bash
+uv run plom compare data/btc.jsonl.gz --profile lighter-standard --grid base-half-spread-bps=0.5,1,2 --grid layers=1,3
+```
+
+`--grid FLAG=V1,V2` takes any config flag; repeated grids are crossed. An interval that straddles zero means the data can't tell yet.
 
 ## Recording
 

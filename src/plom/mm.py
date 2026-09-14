@@ -113,7 +113,7 @@ class Config:
     fill_cooldown_ms: int = 1000
     maker_fee_bps: float = 0.0
     taker_fee_bps: float = 0.0
-    markout_horizons_ms: tuple[int, ...] = (1000, 5000)
+    markout_horizons_ms: tuple[int, ...] = (100, 1000, 5000, 30_000, 60_000, 300_000)
 
 
 @dataclass
@@ -192,6 +192,10 @@ class MarketMaker:
     cash: float = 0.0
     fees: float = 0.0
     volume: float = 0.0
+    spread_capture: float = 0.0
+    """Sum of each fill's edge against the mid at fill time, in quote currency."""
+    inventory_pnl: float = 0.0
+    """PnL from holding the position through mid moves. pnl = spread_capture + inventory_pnl - fees."""
     fills: list[Fill] = field(default_factory=list)
     markouts: list[Markout] = field(default_factory=list)
     orders: dict[Key, Order] = field(default_factory=dict)
@@ -381,6 +385,7 @@ class MarketMaker:
         self.cash -= sign * notional + fee
         self.fees += fee
         self.volume += notional
+        self.spread_capture += sign * ((self.mid or order.price) - order.price) * size
         fill = Fill(
             self.now_ms, order.side, order.layer, order.price, size, fee, self.mid or order.price, self.regime
         )
@@ -398,7 +403,10 @@ class MarketMaker:
                 self.retiring.remove(order)
 
     def _update_mid(self, book: Book) -> None:
-        self.mid = (book.bids[0][0] + book.asks[0][0]) / 2
+        mid = (book.bids[0][0] + book.asks[0][0]) / 2
+        if self.mid is not None:
+            self.inventory_pnl += self.position * (mid - self.mid)
+        self.mid = mid
         if self._vol_ref is None:
             self._vol_ref = (self.now_ms, self.mid)
             return

@@ -1,12 +1,15 @@
 import argparse
 import asyncio
+import itertools
+import os
+from concurrent.futures import ProcessPoolExecutor
 import time
 from collections.abc import AsyncIterator
 from dataclasses import fields, replace
 from pathlib import Path
 from statistics import fmean
 
-from plom import recording
+from plom import evaluate, recording
 from plom.market import Book, Trade
 from plom.mm import Config, MarketMaker, edge_bps
 from plom.pressure import DEFAULT_DEPTH, DEFAULT_HALF_LIFE_BPS, pressure
@@ -35,6 +38,7 @@ def main() -> None:
     )
     m.add_argument("--replay", type=Path, help="recording written by `plom record`")
     m.add_argument("--status-every-s", type=float, default=5.0)
+    m.add_argument("--block-s", type=float, default=evaluate.BLOCK_S, help="bootstrap block length")
     for f in fields(Config):
         if isinstance(f.default, int | float):
             m.add_argument("--" + f.name.replace("_", "-"), type=type(f.default), help=f"default {f.default}")
@@ -45,8 +49,19 @@ def main() -> None:
     r.add_argument("--venues", default=",".join(VENUES), help="comma-separated, default: all")
     r.add_argument("--status-every-s", type=float, default=60.0)
 
+    k = commands.add_parser("compare", help="replay a recording under several configs, in parallel, and compare")
+    k.add_argument("replay", type=Path)
+    k.add_argument("--venue", choices=[v for v in VENUES if v in DEFAULT_PROFILE])
+    k.add_argument("--profile", choices=PROFILES)
+    k.add_argument(
+        "--grid", action="append", default=[], metavar="FLAG=V1,V2,...",
+        help="config values to try, e.g. --grid base-half-spread-bps=0.5,1,2; repeat to cross several",
+    )
+    k.add_argument("--block-s", type=float, default=evaluate.BLOCK_S)
+    k.add_argument("--workers", type=int, default=os.cpu_count())
+
     args = parser.parse_args()
-    command = {"pressure": _pressure, "mm": _mm, "record": _record}[args.command]
+    command = {"pressure": _pressure, "mm": _mm, "record": _record, "compare": _compare}[args.command]
     try:
         asyncio.run(command(args))
     except KeyboardInterrupt:
@@ -87,6 +102,7 @@ async def _mm(args: argparse.Namespace) -> None:
         flush=True,
     )
     mm = MarketMaker(config)
+    tracker = evaluate.Tracker(args.block_s)
     events = _replay_events(args.replay, venue) if args.replay else _live_events(venue, args.coin)
     last_status_ms = None
     try:
@@ -95,13 +111,52 @@ async def _mm(args: argparse.Namespace) -> None:
                 mm.on_book(event)
             else:
                 mm.on_trade(event)
+            tracker.observe(mm)
             if mm.mid is None:
                 continue
             if last_status_ms is None or mm.now_ms - last_status_ms >= args.status_every_s * 1000:
                 last_status_ms = mm.now_ms
                 print(_status(args.coin, mm), flush=True)
     finally:
-        print(_summary(mm), flush=True)
+        print(evaluate.format_report(evaluate.evaluate(mm, tracker)), flush=True)
+        print(_breakdown(mm), flush=True)
+
+
+async def _compare(args: argparse.Namespace) -> None:
+    profile_name = args.profile or DEFAULT_PROFILE[args.venue or "hyperliquid"]
+    profile = PROFILES[profile_name]
+    venue = args.venue or profile.venue
+    base = replace(Config(), **profile.config)
+    defaults = {f.name: f.default for f in fields(Config)}
+    axes = []
+    for spec in args.grid:
+        flag, _, values = spec.partition("=")
+        name = flag.removeprefix("--").replace("-", "_")
+        if name not in defaults or not values:
+            raise SystemExit(f"bad --grid {spec!r}: expected FLAG=V1,V2 with a config flag")
+        axes.append([(name, type(defaults[name])(value)) for value in values.split(",")])
+    variants = [("base", base)] + [
+        (" ".join(f"{name}={value}" for name, value in combo), replace(base, **dict(combo)))
+        for combo in itertools.product(*axes)
+    ]
+    print(f"{venue} ({profile_name}): {len(variants)} runs on {args.replay}", flush=True)
+    with ProcessPoolExecutor(max_workers=args.workers) as pool:
+        futures = [
+            pool.submit(evaluate.replay, args.replay, venue, config, label, args.block_s)
+            for label, config in variants
+        ]
+        results = [future.result() for future in futures]
+    base_result = results[0]
+    print(f"\n{base_result.hours:.2f}h of market time, {len(base_result.block_pnls)} blocks of {args.block_s:g}s\n")
+    print(f"{'variant':<40} {'fills':>6} {'fees $':>8} {'pnl $':>9} {'pnl $/h [95%]':>30} {'vs base $/h [95%]':>30} {'mo1s':>6} {'mo60s':>6}")
+    for e in sorted(results, key=lambda e: e.pnl, reverse=True):
+        horizon = {h.horizon_ms: h for h in e.horizons}
+        mo = lambda ms: f"{horizon[ms].mean_bps.mean:+6.2f}" if ms in horizon and horizon[ms].mean_bps else "   n/a"
+        difference = "" if e is base_result else str(evaluate.paired_difference(e, base_result) or "n/a")
+        print(
+            f"{e.label:<40} {e.fills:>6} {e.fees:>8.3f} {e.pnl:>+9.3f} {str(e.pnl_per_hour or 'n/a'):>30} "
+            f"{difference:>30} {mo(1000)} {mo(60_000)}"
+        )
 
 
 async def _live_events(venue: str, coin: str) -> AsyncIterator[Book | Trade]:
@@ -124,6 +179,7 @@ def _status(coin: str, mm: MarketMaker) -> str:
     markouts = " ".join(
         f"mo{h / 1000:g}s {_mean([m.bps for m in mm.markouts if m.horizon_ms == h]):+.2f}"
         for h in mm.config.markout_horizons_ms
+        if h in (1000, 5000)
     )
     return (
         f"{_clock(mm.now_ms)}  {coin}  mid {mm.mid:,.6g}  [{quotes}]  "
@@ -140,49 +196,37 @@ def _side_quotes(mm: MarketMaker, side: str) -> str:
     return f"{side} {orders[0].price:,.6g} x{len(orders)}" if orders else f"{side} -"
 
 
-def _summary(mm: MarketMaker) -> str:
-    horizons = mm.config.markout_horizons_ms
+def _breakdown(mm: MarketMaker) -> str:
+    """Fills, edge and short markouts per layer and per regime."""
+    horizons = [h for h in mm.config.markout_horizons_ms if h <= 5000]
+    header = "fills     volume    edge  " + "  ".join(f"{f'mo{h / 1000:g}s':>6}" for h in horizons)
     lines = [
         "",
-        "--- summary ---",
-        f"fills          {len(mm.fills)}",
-        f"volume         ${mm.volume:,.2f}",
-        f"position       {mm.position:+.5f}",
-        f"fees           ${mm.fees:,.4f}",
-        f"pnl (at mid)   ${mm.pnl:+,.4f}",
-        f"jumps          {mm.jumps}",
-        f"transactions   {mm.tx_sent:,} sent, {mm.tx_skipped:,} skipped by the rate limit",
+        f"pulled         buy {mm.pulled_ms['buy'] / 1000:,.0f}s  sell {mm.pulled_ms['sell'] / 1000:,.0f}s"
+        f"   jumps {mm.jumps}",
         "regime time    " + "  ".join(f"{r} {ms / 1000:,.0f}s" for r, ms in mm.regime_ms.items()),
-        f"pulled         buy {mm.pulled_ms['buy'] / 1000:,.0f}s  sell {mm.pulled_ms['sell'] / 1000:,.0f}s",
-        f"pickoff        buy {mm.pickoff_bps('buy'):+.2f}bps  sell {mm.pickoff_bps('sell'):+.2f}bps",
         "",
-        "layer  fills     volume    edge  " + "  ".join(f"{f'mo{h / 1000:g}s':>6}" for h in horizons),
+        f"layer    {header}",
     ]
-    for layer in sorted({f.layer for f in mm.fills}):
-        fills = [f for f in mm.fills if f.layer == layer]
-        markouts = [
-            _mean([m.bps for m in mm.markouts if m.fill.layer == layer and m.horizon_ms == h])
-            for h in horizons
-        ]
-        lines.append(
-            f"{layer:>5}  {len(fills):>5}  {sum(f.price * f.size for f in fills):>9,.0f}  "
-            f"{_mean([edge_bps(f, f.mid) for f in fills]):>+6.2f}  "
-            + "  ".join(f"{m:>+6.2f}" for m in markouts)
-        )
-    lines += ["", "regime   fills    edge  " + "  ".join(f"{f'mo{h / 1000:g}s':>6}" for h in horizons)]
-    for regime in mm.regime_ms:
-        fills = [f for f in mm.fills if f.regime == regime]
-        if not fills:
+    for label, group in [
+        *((f"{layer:>5}  ", [f for f in mm.fills if f.layer == layer]) for layer in sorted({f.layer for f in mm.fills})),
+        ("", []),
+        *((f"{regime:<7}", [f for f in mm.fills if f.regime == regime]) for regime in mm.regime_ms),
+    ]:
+        if not label:
+            lines += ["", f"regime   {header}"]
             continue
+        if not group:
+            continue
+        ids = {id(f) for f in group}
         markouts = [
-            _mean([m.bps for m in mm.markouts if m.fill.regime == regime and m.horizon_ms == h])
-            for h in horizons
+            _mean([m.bps for m in mm.markouts if id(m.fill) in ids and m.horizon_ms == h]) for h in horizons
         ]
         lines.append(
-            f"{regime:<7}  {len(fills):>5}  {_mean([edge_bps(f, f.mid) for f in fills]):>+6.2f}  "
+            f"{label}  {len(group):>5}  {sum(f.price * f.size for f in group):>9,.0f}  "
+            f"{_mean([edge_bps(f, f.mid) for f in group]):>+6.2f}  "
             + "  ".join(f"{m:>+6.2f}" for m in markouts)
         )
-    lines.append("(edge and markouts in bps; volume in $)")
     return "\n".join(lines)
 
 
