@@ -10,6 +10,7 @@ from pathlib import Path
 from statistics import fmean
 
 from plom import evaluate, recording, runner
+from plom.alpha import FEATURES
 from plom.market import Book, Trade
 from plom.mm import Config, MarketMaker, edge_bps
 from plom.pressure import DEFAULT_DEPTH, DEFAULT_HALF_LIFE_BPS, pressure
@@ -224,6 +225,11 @@ def _breakdown(mm: MarketMaker) -> str:
         f"pulled         buy {mm.pulled_ms['buy'] / 1000:,.0f}s  sell {mm.pulled_ms['sell'] / 1000:,.0f}s"
         f"   jumps {mm.jumps}",
         "regime time    " + "  ".join(f"{r} {ms / 1000:,.0f}s" for r, ms in mm.regime_ms.items()),
+        f"reference      {mm.reference_jumps} jumps, basis {(mm.basis or 0) * 10_000:+.2f}bps",
+        f"alpha          out-of-sample r2 {mm.alpha.r2 if mm.alpha.r2 is None else round(mm.alpha.r2, 3)}"
+        f" over {mm.alpha.scored:,} forecasts; weights "
+        + "  ".join(f"{name} {w:+.3f}" for name, w in zip(FEATURES, mm.alpha.weights))
+        + f"; pulls buy {mm.alpha_pulls['buy']} sell {mm.alpha_pulls['sell']}",
         "",
         f"layer    {header}",
     ]

@@ -14,6 +14,7 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
+from plom.alpha import AlphaConfig, OnlineAlpha
 from plom.market import Book, Trade
 from plom.pressure import pressure
 
@@ -62,6 +63,20 @@ class Config:
     """A reference move this large within reference_jump_window_ms counts as a jump and pulls the side
     it runs towards until the venue's next book."""
     reference_jump_window_ms: int = 250
+
+    alpha_horizon_ms: int = 1000
+    """The online forecast predicts the mid's move over this horizon (see plom.alpha)."""
+    alpha_sample_ms: int = 100
+    alpha_half_life_samples: float = 3000.0
+    alpha_ridge: float = 1.0
+    alpha_warmup_samples: int = 600
+    flow_half_life_ms: int = 1000
+    alpha_weight: float = 0.0
+    """Shift fair value by this fraction of the forecast move; 0 learns and reports without using it."""
+    alpha_widen: float = 0.0
+    """Widen a side's half spread by this multiple of the forecast move against it."""
+    alpha_pull_margin_bps: float = math.inf
+    """Pull a side while the forecast move against it exceeds its half spread plus maker fee plus this."""
 
     pickoff_horizon_ms: int = 1000
     """A fill is judged by how the mid moved this long after it."""
@@ -199,6 +214,8 @@ class MarketMaker:
     reference_mid: float | None = None
     reference_ms: int | None = None
     reference_jumps: int = 0
+    alpha_pulls: dict[Side, int] = field(default_factory=lambda: {"buy": 0, "sell": 0})
+    """Requotes at which the forecast pulled a side."""
     regime: Regime = "normal"
     pressure: float = 0.0
     bias: int = 0
@@ -243,6 +260,12 @@ class MarketMaker:
         self._last_fill_ms: dict[Side, int | None] = {"buy": None, "sell": None}
         self._pickoff: dict[Side, tuple[float, int]] = {"buy": (0.0, 0), "sell": (0.0, 0)}
         self._basis = _TimeEwma(self.config.basis_half_life_s)
+        c = self.config
+        self.alpha = OnlineAlpha(AlphaConfig(
+            c.alpha_horizon_ms, c.alpha_sample_ms, c.alpha_half_life_samples, c.alpha_ridge,
+            c.alpha_warmup_samples, c.flow_half_life_ms,
+        ))
+        self._quoted_prediction = 0.0
         self._basis_ms: int | None = None
         self._reference_mids: deque[tuple[int, float]] = deque()
         horizons = {*self.config.markout_horizons_ms, self.config.pickoff_horizon_ms}
@@ -310,6 +333,9 @@ class MarketMaker:
         self._update_mid(book)
         self.local_fair = fair_price(book, self.config)
         self._update_basis()
+        self.alpha.on_book(self.now_ms, book, self.mid, self._gap_bps())
+        if abs(self.alpha.prediction_bps - self._quoted_prediction) >= self.config.requote_move_bps:
+            self._dirty = True
         self._update_fair()
         self.regime = classify_regime(self.vol_ratio, self.config)
         jumped = previous_mid is not None and abs(self.mid / previous_mid - 1) * 10_000 >= self.config.jump_bps
@@ -359,18 +385,24 @@ class MarketMaker:
             self._basis.add(math.log(self.mid / self.reference_mid), dt_s)
         self._basis_ms = self.now_ms
 
-    def _update_fair(self) -> None:
-        self.fair = self.local_fair
+    def _gap_bps(self) -> float:
+        """Basis-adjusted reference minus local fair price, in bps; 0 without a fresh reference."""
         if self.basis is None or not self.reference_fresh or self.local_fair is None:
+            return 0.0
+        return (self.reference_mid * math.exp(self.basis) / self.local_fair - 1) * 10_000
+
+    def _update_fair(self) -> None:
+        if self.local_fair is None:
             return
-        adjusted = self.reference_mid * math.exp(self.basis)
-        self.fair = self.local_fair + self.config.reference_weight * (adjusted - self.local_fair)
+        gap = self._gap_bps() * self.config.reference_weight + self.alpha.prediction_bps * self.config.alpha_weight
+        self.fair = self.local_fair * (1 + gap / 10_000)
 
     def on_trade(self, trade: Trade) -> None:
         stale = trade.time_ms + 1000 < self.now_ms
         self.now_ms = max(self.now_ms, trade.time_ms)
         self._activate_pending()
         self._fill_from_trade(trade)
+        self.alpha.on_trade(self.now_ms, trade)
         if stale or self.mid is None:
             return
         sign = 1 if trade.side == "buy" else -1
@@ -557,11 +589,18 @@ class MarketMaker:
     def _requote(self) -> None:
         self._last_requote_ms = self.now_ms
         self._quoted_fair = self.fair
+        self._quoted_prediction = self.alpha.prediction_bps
         self._dirty = False
         jump = self.is_jumping
         c = regime_config(self.config, self.regime)
         half = half_spread_bps(self.vol_bps, c) * (c.jump_spread_mult if jump else 1.0)
         spreads = {side: half * (1 + c.pickoff_spread_mult * self.pickoff_score(side)) for side in SIDES}
+        against = {"buy": -self.alpha.prediction_bps, "sell": self.alpha.prediction_bps}
+        for side in SIDES:
+            spreads[side] += c.alpha_widen * max(0.0, against[side])
+        alpha_pulled = {
+            side: against[side] > spreads[side] + c.maker_fee_bps + c.alpha_pull_margin_bps for side in SIDES
+        }
         bids, asks = quotes(
             self.fair, self.book.bids[0][0], self.book.asks[0][0],
             skew_bps(self.position, self.bias, c), spreads["buy"], spreads["sell"], c,
@@ -570,7 +609,9 @@ class MarketMaker:
         live_from = self.now_ms + c.order_latency_ms
         cancel_at = self.now_ms + c.cancel_latency_ms
         for side, prices in (("buy", bids), ("sell", asks)):
-            if self.is_pulled(side):
+            if alpha_pulled[side]:
+                self.alpha_pulls[side] += 1
+            if self.is_pulled(side) or alpha_pulled[side]:
                 wanted = {}
             else:
                 last_fill = self._last_fill_ms[side]
