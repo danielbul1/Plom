@@ -8,7 +8,7 @@ Our orders don't move the real market, so results are optimistic for sizes that 
 
 import math
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from plom.hyperliquid import Book, Trade
@@ -18,6 +18,7 @@ Side = Literal["buy", "sell"]
 SIDES: tuple[Side, Side] = ("buy", "sell")
 Key = tuple[Side, int]
 """An order slot: side and layer (0 is nearest the mid)."""
+Regime = Literal["calm", "normal", "chaotic"]
 EPSILON = 1e-9
 
 
@@ -42,6 +43,10 @@ class Config:
     """How far quotes shift towards the book-pressure bias."""
     pressure_enter: float = 0.3
     pressure_exit: float = 0.1
+    microprice_imbalance: float = 0.5
+    """Quote around the microprice instead of the mid once top-of-book size imbalance reaches this."""
+    microprice_weight: float = 1.0
+    """How far to move from the mid towards the microprice: 0 is the mid, 1 is the microprice."""
 
     pickoff_horizon_ms: int = 1000
     """A fill is judged by how the mid moved this long after it."""
@@ -61,6 +66,23 @@ class Config:
     trend_exit_z: float = 1.0
     trend_floor_bps: float = 1.0
     """Smallest expected move, so a quiet market doesn't make every tick look like a trend."""
+
+    vol_baseline_half_life_s: float = 600.0
+    """Regimes compare recent volatility (vol_half_life_s) with this slower baseline."""
+    calm_below: float = 0.7
+    """Calm while recent volatility is below this fraction of the baseline."""
+    chaotic_above: float = 1.5
+    """Chaotic while recent volatility is above this multiple of the baseline."""
+    calm_spread_mult: float = 0.8
+    calm_size_mult: float = 1.25
+    calm_ttl_mult: float = 2.0
+    chaotic_spread_mult: float = 2.0
+    chaotic_size_mult: float = 0.5
+    chaotic_ttl_mult: float = 0.5
+    chaotic_layers: int = 2
+    chaotic_spacing_mult: float = 1.5
+    chaotic_size_growth_mult: float = 1.5
+    """Backload size harder in chaos: layers grow faster away from the touch."""
 
     latency_ms: int = 150
     requote_interval_ms: int = 500
@@ -100,6 +122,7 @@ class Fill:
     size: float
     fee: float
     mid: float
+    regime: Regime = "normal"
 
 
 @dataclass(frozen=True)
@@ -111,11 +134,32 @@ class Markout:
 
 
 @dataclass
+class _TimeEwma:
+    """Exponentially weighted mean over time, corrected for starting from nothing."""
+
+    half_life_s: float
+    _sum: float = 0.0
+    _weight: float = 0.0
+
+    def add(self, value: float, dt_s: float) -> None:
+        alpha = 1 - 0.5 ** (dt_s / self.half_life_s)
+        self._sum = (1 - alpha) * self._sum + alpha * value
+        self._weight = (1 - alpha) * self._weight + alpha
+
+    @property
+    def mean(self) -> float:
+        return self._sum / self._weight if self._weight > 0 else 0.0
+
+
+@dataclass
 class MarketMaker:
     config: Config = field(default_factory=Config)
     now_ms: int = 0
     book: Book | None = None
     mid: float | None = None
+    fair: float | None = None
+    """What we quote around: the mid, pulled towards the microprice when the top of book is lopsided."""
+    regime: Regime = "normal"
     pressure: float = 0.0
     bias: int = 0
     """-1, 0 or +1: which way book pressure leans, with hysteresis."""
@@ -134,12 +178,14 @@ class MarketMaker:
     swept: dict[Side, bool] = field(default_factory=lambda: {"buy": False, "sell": False})
     """A trade jumped through this side since the last book, so its quotes are pulled until a fresh one."""
     jumps: int = 0
+    regime_ms: dict[Regime, int] = field(default_factory=lambda: {"calm": 0, "normal": 0, "chaotic": 0})
 
     def __post_init__(self) -> None:
-        self._quoted_mid: float | None = None
+        self._quoted_fair: float | None = None
         self._dirty = False
         self._jump_until_ms: int | None = None
-        self._var_per_s = 0.0
+        self._vol = _TimeEwma(self.config.vol_half_life_s)
+        self._vol_baseline = _TimeEwma(self.config.vol_baseline_half_life_s)
         self._vol_ref: tuple[int, float] | None = None
         self._mids: deque[tuple[int, float]] = deque()
         self._last_book_ms: int | None = None
@@ -155,8 +201,14 @@ class MarketMaker:
 
     @property
     def vol_bps(self) -> float:
-        """One-second volatility of the mid, in bps."""
-        return math.sqrt(self._var_per_s)
+        """Recent one-second volatility of the mid, in bps."""
+        return math.sqrt(self._vol.mean)
+
+    @property
+    def vol_ratio(self) -> float:
+        """Recent volatility relative to its slow baseline; 1 before there is a baseline."""
+        baseline = self._vol_baseline.mean
+        return math.sqrt(self._vol.mean / baseline) if baseline > 0 else 1.0
 
     def pickoff_bps(self, side: Side) -> float:
         """Recent average adverse markout of this side's fills, decayed while it doesn't fill."""
@@ -184,23 +236,28 @@ class MarketMaker:
         if not book.bids or not book.asks:
             return
         if self._last_book_ms is not None:
+            elapsed = self.now_ms - self._last_book_ms
+            self.regime_ms[self.regime] += elapsed
             for side in SIDES:
                 if self.is_pulled(side):
-                    self.pulled_ms[side] += self.now_ms - self._last_book_ms
+                    self.pulled_ms[side] += elapsed
         self._last_book_ms = self.now_ms
         was_swept = any(self.swept.values())
         self.swept = {"buy": False, "sell": False}
-        previous_mid, trend, bias = self.mid, self.trend, self.bias
+        previous_mid, trend, bias, regime = self.mid, self.trend, self.bias, self.regime
         self._update_mid(book)
+        self.fair = fair_price(book, self.config)
+        self.regime = classify_regime(self.vol_ratio, self.config)
         jumped = previous_mid is not None and abs(self.mid / previous_mid - 1) * 10_000 >= self.config.jump_bps
         if jumped:
             self._start_jump()
         self._update_trend()
         self._update_bias(book)
         self._settle_markouts()
-        if self.bias != bias:
+        if self.bias != bias or self.regime != regime:
             self._dirty = True
-        self._maybe_requote(urgent=jumped or was_swept or self.trend != trend)
+        turned_chaotic = self.regime == "chaotic" and regime != "chaotic"
+        self._maybe_requote(urgent=jumped or was_swept or turned_chaotic or self.trend != trend)
 
     def on_trade(self, trade: Trade) -> None:
         stale = trade.time_ms + 1000 < self.now_ms
@@ -267,7 +324,9 @@ class MarketMaker:
         self.cash -= sign * notional + fee
         self.fees += fee
         self.volume += notional
-        fill = Fill(self.now_ms, order.side, order.layer, order.price, size, fee, self.mid or order.price)
+        fill = Fill(
+            self.now_ms, order.side, order.layer, order.price, size, fee, self.mid or order.price, self.regime
+        )
         self.fills.append(fill)
         for queue in self._unsettled.values():
             queue.append(fill)
@@ -287,9 +346,9 @@ class MarketMaker:
         dt_s = (self.now_ms - ref_ms) / 1000
         if dt_s <= 0:
             return
-        move_bps = (self.mid / ref_mid - 1) * 10_000
-        alpha = 1 - 0.5 ** (dt_s / self.config.vol_half_life_s)
-        self._var_per_s = (1 - alpha) * self._var_per_s + alpha * move_bps**2 / dt_s
+        variance_per_s = ((self.mid / ref_mid - 1) * 10_000) ** 2 / dt_s
+        self._vol.add(variance_per_s, dt_s)
+        self._vol_baseline.add(variance_per_s, dt_s)
         self._vol_ref = (self.now_ms, self.mid)
 
     def _update_trend(self) -> None:
@@ -347,21 +406,22 @@ class MarketMaker:
         if not urgent and last is not None:
             if self.now_ms - last < c.requote_interval_ms:
                 return
-            moved = abs(self.mid / self._quoted_mid - 1) * 10_000 >= c.requote_move_bps
-            if not (self._dirty or moved or self.now_ms - last >= c.requote_ttl_ms):
+            moved = abs(self.fair / self._quoted_fair - 1) * 10_000 >= c.requote_move_bps
+            ttl_mult = {"calm": c.calm_ttl_mult, "normal": 1.0, "chaotic": c.chaotic_ttl_mult}[self.regime]
+            if not (self._dirty or moved or self.now_ms - last >= c.requote_ttl_ms * ttl_mult):
                 return
         self._requote()
 
     def _requote(self) -> None:
-        c = self.config
         self._last_requote_ms = self.now_ms
-        self._quoted_mid = self.mid
+        self._quoted_fair = self.fair
         self._dirty = False
         jump = self.is_jumping
+        c = regime_config(self.config, self.regime)
         half = half_spread_bps(self.vol_bps, c) * (c.jump_spread_mult if jump else 1.0)
         spreads = {side: half * (1 + c.pickoff_spread_mult * self.pickoff_score(side)) for side in SIDES}
         bids, asks = quotes(
-            self.mid, self.book.bids[0][0], self.book.asks[0][0],
+            self.fair, self.book.bids[0][0], self.book.asks[0][0],
             skew_bps(self.position, self.bias, c), spreads["buy"], spreads["sell"], c,
         )
         capacity = {"buy": c.max_position - self.position, "sell": c.max_position + self.position}
@@ -386,6 +446,47 @@ class MarketMaker:
                 current = self.pending.get(key) or self.orders.get(key)
                 if current is None or current.size <= EPSILON or current.price != price:
                     self.pending[key] = Order(side, layer, price, size, live_from)
+
+
+def fair_price(book: Book, config: Config) -> float:
+    """The mid, moved towards the size-weighted microprice when top-of-book sizes are lopsided."""
+    (bid, bid_size), (ask, ask_size) = book.bids[0], book.asks[0]
+    mid = (bid + ask) / 2
+    total = bid_size + ask_size
+    if total <= 0 or abs(bid_size - ask_size) / total < config.microprice_imbalance:
+        return mid
+    microprice = (bid * ask_size + ask * bid_size) / total
+    return mid + config.microprice_weight * (microprice - mid)
+
+
+def classify_regime(vol_ratio: float, config: Config) -> Regime:
+    if vol_ratio >= config.chaotic_above:
+        return "chaotic"
+    if vol_ratio < config.calm_below:
+        return "calm"
+    return "normal"
+
+
+def regime_config(config: Config, regime: Regime) -> Config:
+    """The config to quote with in a regime: calm is tighter and bigger; chaos is wider, smaller and deeper."""
+    match regime:
+        case "calm":
+            return replace(
+                config,
+                base_half_spread_bps=config.base_half_spread_bps * config.calm_spread_mult,
+                order_size=config.order_size * config.calm_size_mult,
+            )
+        case "chaotic":
+            return replace(
+                config,
+                base_half_spread_bps=config.base_half_spread_bps * config.chaotic_spread_mult,
+                order_size=config.order_size * config.chaotic_size_mult,
+                layers=min(config.layers, config.chaotic_layers),
+                layer_spacing=config.layer_spacing * config.chaotic_spacing_mult,
+                size_growth=config.size_growth * config.chaotic_size_growth_mult,
+            )
+        case _:
+            return config
 
 
 def half_spread_bps(vol_bps: float, config: Config) -> float:

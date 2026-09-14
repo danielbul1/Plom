@@ -115,7 +115,7 @@ def _status(coin: str, mm: MarketMaker) -> str:
         f"{_clock(mm.now_ms)}  {coin}  mid {mm.mid:,.6g}  [{quotes}]  "
         f"pos {mm.position:+.5f}  pnl {mm.pnl:+.2f}  fills {len(mm.fills)}  "
         f"edge {_mean([edge_bps(f, f.mid) for f in mm.fills]):+.2f}bps  {markouts}  "
-        f"vol {mm.vol_bps:.2f}bps  bias {mm.bias:+d}  trend {mm.trend:+d}  "
+        f"vol {mm.vol_bps:.2f}bps x{mm.vol_ratio:.1f} {mm.regime}  bias {mm.bias:+d}  trend {mm.trend:+d}  "
         f"pickoff b{mm.pickoff_score('buy'):.2f}/s{mm.pickoff_score('sell'):.2f}"
     )
 
@@ -137,6 +137,7 @@ def _summary(mm: MarketMaker) -> str:
         f"fees           ${mm.fees:,.4f}",
         f"pnl (at mid)   ${mm.pnl:+,.4f}",
         f"jumps          {mm.jumps}",
+        "regime time    " + "  ".join(f"{r} {ms / 1000:,.0f}s" for r, ms in mm.regime_ms.items()),
         f"pulled         buy {mm.pulled_ms['buy'] / 1000:,.0f}s  sell {mm.pulled_ms['sell'] / 1000:,.0f}s",
         f"pickoff        buy {mm.pickoff_bps('buy'):+.2f}bps  sell {mm.pickoff_bps('sell'):+.2f}bps",
         "",
@@ -151,6 +152,19 @@ def _summary(mm: MarketMaker) -> str:
         lines.append(
             f"{layer:>5}  {len(fills):>5}  {sum(f.price * f.size for f in fills):>9,.0f}  "
             f"{_mean([edge_bps(f, f.mid) for f in fills]):>+6.2f}  "
+            + "  ".join(f"{m:>+6.2f}" for m in markouts)
+        )
+    lines += ["", "regime   fills    edge  " + "  ".join(f"{f'mo{h / 1000:g}s':>6}" for h in horizons)]
+    for regime in mm.regime_ms:
+        fills = [f for f in mm.fills if f.regime == regime]
+        if not fills:
+            continue
+        markouts = [
+            _mean([m.bps for m in mm.markouts if m.fill.regime == regime and m.horizon_ms == h])
+            for h in horizons
+        ]
+        lines.append(
+            f"{regime:<7}  {len(fills):>5}  {_mean([edge_bps(f, f.mid) for f in fills]):>+6.2f}  "
             + "  ".join(f"{m:>+6.2f}" for m in markouts)
         )
     lines.append("(edge and markouts in bps; volume in $)")

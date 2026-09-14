@@ -4,7 +4,17 @@ from dataclasses import replace
 import pytest
 
 from plom.hyperliquid import Book, Trade
-from plom.mm import Config, MarketMaker, half_spread_bps, quotes, skew_bps, tick_size
+from plom.mm import (
+    Config,
+    MarketMaker,
+    classify_regime,
+    fair_price,
+    half_spread_bps,
+    quotes,
+    regime_config,
+    skew_bps,
+    tick_size,
+)
 
 # One layer, mid 100, tick 0.01, 10 bps half spread: quotes at 99.90 / 100.10.
 CONFIG = Config(
@@ -24,6 +34,9 @@ CONFIG = Config(
     trend_enter_z=math.inf,
     requote_move_bps=0,
     jump_bps=math.inf,
+    microprice_weight=0,
+    calm_below=0,
+    chaotic_above=math.inf,
 )
 # Three layers at 10 / 20 / 40 bps sized 1 / 2 / 4.
 LAYERED = replace(CONFIG, layers=3, layer_spacing=2.0, size_growth=2.0, max_position=10.0)
@@ -262,33 +275,42 @@ def test_favourable_markouts_do_not_widen():
 
 
 TREND = replace(CONFIG, trend_window_s=1.0, trend_enter_z=2.0, trend_exit_z=1.0, trend_floor_bps=1.0)
+UP = dict(bids=((100.09, 1.0),), asks=((100.11, 1.0),))
+DOWN = dict(bids=((99.89, 1.0),), asks=((99.91, 1.0),))
+
+
+def quiet_mm(config, until_ms=30_100):
+    """A live market maker that has seen a flat mid once a second, so volatility is near zero."""
+    mm = live_mm(config)
+    for t in range(1100, until_ms + 1, 1000):
+        mm.on_book(book(t))
+    return mm
 
 
 def test_uptrend_pulls_asks_and_keeps_bids():
-    mm = live_mm(TREND)
-    mm.on_book(book(1100, bids=((100.09, 1.0),), asks=((100.11, 1.0),)))  # +10 bps in a second
+    mm = quiet_mm(TREND)
+    mm.on_book(book(31_100, **UP))  # +10 bps in a second
     assert mm.trend == 1
-    mm.on_book(book(1250, bids=((100.09, 1.0),), asks=((100.11, 1.0),)))
+    mm.on_book(book(31_250, **UP))
     assert BUY in mm.orders
     assert SELL not in mm.orders
     assert mm.pulled_ms["sell"] == 150
 
 
 def test_downtrend_pulls_bids():
-    mm = live_mm(TREND)
-    mm.on_book(book(1100, bids=((99.89, 1.0),), asks=((99.91, 1.0),)))
+    mm = quiet_mm(TREND)
+    mm.on_book(book(31_100, **DOWN))
     assert mm.trend == -1
-    mm.on_book(book(1250, bids=((99.89, 1.0),), asks=((99.91, 1.0),)))
+    mm.on_book(book(31_250, **DOWN))
     assert BUY not in mm.orders
     assert SELL in mm.orders
 
 
 def test_trend_ends_when_drift_fades_and_asks_return():
-    mm = live_mm(TREND)
-    flat = dict(bids=((100.09, 1.0),), asks=((100.11, 1.0),))
-    mm.on_book(book(1100, **flat))
-    mm.on_book(book(1250, **flat))
-    mm.on_book(book(2300, **flat))
+    mm = quiet_mm(TREND)
+    mm.on_book(book(31_100, **UP))
+    mm.on_book(book(31_250, **UP))
+    mm.on_book(book(32_300, **UP))
     assert mm.trend == 0
     assert SELL in mm.pending
 
@@ -368,3 +390,78 @@ def test_old_trades_do_not_count_as_jumps():
     mm.on_trade(Trade(1000, "sell", 99.00, 0.01))
     assert not mm.is_jumping
     assert not mm.swept["buy"]
+
+
+MICRO = replace(CONFIG, microprice_weight=1.0, microprice_imbalance=0.5)
+
+
+def test_fair_price_is_the_mid_when_top_of_book_is_balanced():
+    assert fair_price(book(0, bids=((99.99, 3.0),), asks=((100.01, 2.0),)), MICRO) == pytest.approx(100.0)
+
+
+def test_fair_price_leans_to_microprice_when_top_of_book_is_lopsided():
+    # 9 bid vs 1 ask: imbalance 0.8, microprice (99.99 x 1 + 100.01 x 9) / 10.
+    lopsided = book(0, bids=((99.99, 9.0),), asks=((100.01, 1.0),))
+    assert fair_price(lopsided, MICRO) == pytest.approx(100.008)
+    assert fair_price(lopsided, replace(MICRO, microprice_weight=0.5)) == pytest.approx(100.004)
+
+
+def test_quotes_centre_on_the_fair_price():
+    mm = live_mm(MICRO, bids=((99.99, 9.0),), asks=((100.01, 1.0),))
+    assert mm.orders[SELL].price == 100.11
+    assert mm.orders[BUY].price == 99.90
+
+
+def test_regimes_follow_the_volatility_ratio():
+    config = replace(CONFIG, calm_below=0.7, chaotic_above=1.5)
+    assert classify_regime(0.5, config) == "calm"
+    assert classify_regime(1.0, config) == "normal"
+    assert classify_regime(1.5, config) == "chaotic"
+
+
+def test_calm_quotes_tighter_and_bigger():
+    calm = regime_config(replace(LAYERED, calm_spread_mult=0.5, calm_size_mult=2.0), "calm")
+    assert calm.base_half_spread_bps == 5
+    assert calm.order_size == 2.0
+    assert calm.layers == 3
+
+
+def test_chaos_quotes_wider_smaller_with_fewer_deeper_layers():
+    chaotic = regime_config(
+        replace(
+            LAYERED,
+            chaotic_spread_mult=2.0,
+            chaotic_size_mult=0.5,
+            chaotic_layers=2,
+            chaotic_spacing_mult=1.5,
+            chaotic_size_growth_mult=1.5,
+        ),
+        "chaotic",
+    )
+    assert chaotic.base_half_spread_bps == 20
+    assert chaotic.order_size == 0.5
+    assert chaotic.layers == 2
+    assert chaotic.layer_spacing == 3.0
+    assert chaotic.size_growth == 3.0
+    assert regime_config(LAYERED, "normal") is LAYERED
+
+
+def test_volatility_burst_turns_chaotic_and_drops_layers():
+    config = replace(
+        LAYERED, vol_half_life_s=5, vol_baseline_half_life_s=300, calm_below=0.7, chaotic_above=1.5
+    )
+    mm = live_mm(config)
+    ripple = [dict(), dict(bids=((100.00, 1.0),), asks=((100.02, 1.0),))]  # mid 100.00 / 100.01
+    t = 100
+    for i in range(600):
+        t += 1000
+        mm.on_book(book(t, **ripple[i % 2]))
+    assert mm.regime == "normal"
+    burst = [dict(), dict(bids=((100.09, 1.0),), asks=((100.11, 1.0),))]  # mid 100.00 / 100.10
+    for i in range(10):
+        t += 1000
+        mm.on_book(book(t, **burst[i % 2]))
+    assert mm.regime == "chaotic"
+    mm.on_book(book(t + 200, **burst[1]))
+    assert {k for k in mm.orders if k[0] == "buy"} == {("buy", 0), ("buy", 1)}
+    assert mm.regime_ms["chaotic"] > 0
