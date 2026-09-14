@@ -16,14 +16,23 @@ from plom.pressure import pressure
 
 Side = Literal["buy", "sell"]
 SIDES: tuple[Side, Side] = ("buy", "sell")
+Key = tuple[Side, int]
+"""An order slot: side and layer (0 is nearest the mid)."""
 EPSILON = 1e-9
 
 
 @dataclass(frozen=True)
 class Config:
     order_size: float = 0.001
+    """Size of the inner layer."""
     max_position: float = 0.01
+    layers: int = 3
+    layer_spacing: float = 4.0
+    """Each layer sits layer_spacing times further from the reservation price than the one inside it."""
+    size_growth: float = 2.0
+    """Each layer is size_growth times larger than the one inside it."""
     base_half_spread_bps: float = 0.5
+    """Distance of the inner layer from the reservation price."""
     vol_multiplier: float = 1.0
     """Half spread widens to vol_multiplier x one-second volatility when that is larger."""
     vol_half_life_s: float = 30.0
@@ -43,6 +52,7 @@ class Config:
 @dataclass
 class Order:
     side: Side
+    layer: int
     price: float
     size: float
     """Remaining size. A pending order with size 0 is a cancel."""
@@ -54,10 +64,19 @@ class Order:
 class Fill:
     time_ms: int
     side: Side
+    layer: int
     price: float
     size: float
     fee: float
     mid: float
+
+
+@dataclass(frozen=True)
+class Markout:
+    fill: Fill
+    horizon_ms: int
+    bps: float
+    """How far the mid moved in the fill's favour after horizon_ms."""
 
 
 @dataclass
@@ -74,9 +93,9 @@ class MarketMaker:
     fees: float = 0.0
     volume: float = 0.0
     fills: list[Fill] = field(default_factory=list)
-    orders: dict[Side, Order | None] = field(default_factory=lambda: {"buy": None, "sell": None})
-    pending: dict[Side, Order | None] = field(default_factory=lambda: {"buy": None, "sell": None})
-    markouts: dict[int, list[float]] = field(default_factory=dict)
+    markouts: list[Markout] = field(default_factory=list)
+    orders: dict[Key, Order] = field(default_factory=dict)
+    pending: dict[Key, Order] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._var_per_s = 0.0
@@ -84,7 +103,6 @@ class MarketMaker:
         self._last_requote_ms: int | None = None
         self._last_fill_ms: dict[Side, int | None] = {"buy": None, "sell": None}
         self._unsettled: dict[int, deque[Fill]] = {h: deque() for h in self.config.markout_horizons_ms}
-        self.markouts = {h: [] for h in self.config.markout_horizons_ms}
 
     @property
     def pnl(self) -> float:
@@ -99,9 +117,8 @@ class MarketMaker:
         self.now_ms = max(self.now_ms, book.time_ms)
         self.book = book
         self._activate_pending()
-        for side in SIDES:
-            if order := self.orders[side]:
-                self._match_book(order, book)
+        for order in list(self.orders.values()):
+            self._match_book(order, book)
         if not book.bids or not book.asks:
             return
         self._update_mid(book)
@@ -113,31 +130,32 @@ class MarketMaker:
         self.now_ms = max(self.now_ms, trade.time_ms)
         self._activate_pending()
         resting: Side = "buy" if trade.side == "sell" else "sell"
-        order = self.orders[resting]
-        if order is None or trade.time_ms < order.live_from_ms:
-            return
-        if _better(resting, order.price, trade.price):
-            self._fill(order, order.size)
-        elif trade.price == order.price:
-            order.queue_ahead -= trade.size
-            if order.queue_ahead < 0:
-                self._fill(order, min(order.size, -order.queue_ahead))
-                order.queue_ahead = 0.0
+        for order in sorted(
+            (o for o in self.orders.values() if o.side == resting), key=lambda o: o.layer
+        ):
+            if trade.time_ms < order.live_from_ms:
+                continue
+            if _better(resting, order.price, trade.price):
+                self._fill(order, order.size)
+            elif trade.price == order.price:
+                order.queue_ahead -= trade.size
+                if order.queue_ahead < 0:
+                    self._fill(order, min(order.size, -order.queue_ahead))
+                    order.queue_ahead = 0.0
 
     def _activate_pending(self) -> None:
         if self.book is None:
             return
-        for side in SIDES:
-            order = self.pending[side]
-            if order is None or order.live_from_ms > self.now_ms:
+        for key, order in list(self.pending.items()):
+            if order.live_from_ms > self.now_ms:
                 continue
-            self.pending[side] = None
+            del self.pending[key]
             if order.size <= EPSILON:
-                self.orders[side] = None
+                self.orders.pop(key, None)
                 continue
-            levels = self.book.bids if side == "buy" else self.book.asks
+            levels = self.book.bids if order.side == "buy" else self.book.asks
             order.queue_ahead = dict(levels).get(order.price, 0.0)
-            self.orders[side] = order
+            self.orders[key] = order
 
     def _match_book(self, order: Order, book: Book) -> None:
         own = book.bids if order.side == "buy" else book.asks
@@ -162,14 +180,15 @@ class MarketMaker:
         self.cash -= sign * notional + fee
         self.fees += fee
         self.volume += notional
-        fill = Fill(self.now_ms, order.side, order.price, size, fee, self.mid or order.price)
+        fill = Fill(self.now_ms, order.side, order.layer, order.price, size, fee, self.mid or order.price)
         self.fills.append(fill)
         for queue in self._unsettled.values():
             queue.append(fill)
         self._last_fill_ms[order.side] = self.now_ms
         order.size -= size
-        if order.size <= EPSILON and self.orders[order.side] is order:
-            self.orders[order.side] = None
+        key = (order.side, order.layer)
+        if order.size <= EPSILON and self.orders.get(key) is order:
+            del self.orders[key]
 
     def _update_mid(self, book: Book) -> None:
         self.mid = (book.bids[0][0] + book.asks[0][0]) / 2
@@ -200,33 +219,33 @@ class MarketMaker:
         for horizon, queue in self._unsettled.items():
             while queue and queue[0].time_ms + horizon <= self.now_ms:
                 fill = queue.popleft()
-                self.markouts[horizon].append(edge_bps(fill, self.mid))
+                self.markouts.append(Markout(fill, horizon, edge_bps(fill, self.mid)))
 
     def _requote(self) -> None:
         c = self.config
         if self._last_requote_ms is not None and self.now_ms - self._last_requote_ms < c.requote_interval_ms:
             return
         self._last_requote_ms = self.now_ms
-        bid, ask = quotes(
+        bids, asks = quotes(
             self.mid, self.book.bids[0][0], self.book.asks[0][0],
             self.vol_bps, self.position, self.bias, c,
         )
-        wanted = {
-            "buy": (bid, min(c.order_size, c.max_position - self.position)),
-            "sell": (ask, min(c.order_size, c.max_position + self.position)),
-        }
-        for side, (price, size) in wanted.items():
+        capacity = {"buy": c.max_position - self.position, "sell": c.max_position + self.position}
+        live_from = self.now_ms + c.latency_ms
+        for side, prices in (("buy", bids), ("sell", asks)):
             last_fill = self._last_fill_ms[side]
             if last_fill is not None and self.now_ms - last_fill < c.fill_cooldown_ms:
                 continue
-            current = self.pending[side] or self.orders[side]
-            has_order = current is not None and current.size > EPSILON
-            live_from = self.now_ms + c.latency_ms
-            if size <= EPSILON:
-                if has_order:
-                    self.pending[side] = Order(side, current.price, 0.0, live_from)
-            elif not has_order or current.price != price:
-                self.pending[side] = Order(side, price, size, live_from)
+            wanted = _ladder(prices, c, capacity[side])
+            for key in {k for k in (*self.orders, *self.pending) if k[0] == side}:
+                current = self.pending.get(key) or self.orders.get(key)
+                if key[1] not in wanted and current.size > EPSILON:
+                    self.pending[key] = Order(side, key[1], current.price, 0.0, live_from)
+            for layer, (price, size) in wanted.items():
+                key = (side, layer)
+                current = self.pending.get(key) or self.orders.get(key)
+                if current is None or current.size <= EPSILON or current.price != price:
+                    self.pending[key] = Order(side, layer, price, size, live_from)
 
 
 def quotes(
@@ -237,10 +256,10 @@ def quotes(
     position: float,
     bias: int,
     config: Config,
-) -> tuple[float, float]:
-    """Bid and ask prices: a spread around a reservation price skewed by inventory and bias.
+) -> tuple[list[float], list[float]]:
+    """Bid and ask prices per layer, inner first, around a reservation price skewed by inventory and bias.
 
-    Never crosses the book, so both quotes would rest as post-only orders.
+    Never crosses the book or our own quotes, and no two layers on a side share a price.
     """
     tick = tick_size(mid)
     half_spread_bps = max(config.base_half_spread_bps, config.vol_multiplier * vol_bps)
@@ -249,16 +268,44 @@ def quotes(
         + config.pressure_skew_bps * bias
     )
     reservation = mid * (1 + skew_bps / 10_000)
-    bid_ticks = math.floor(reservation * (1 - half_spread_bps / 10_000) / tick + EPSILON)
-    ask_ticks = math.ceil(reservation * (1 + half_spread_bps / 10_000) / tick - EPSILON)
-    bid_ticks = min(bid_ticks, round(best_ask / tick) - 1)
-    ask_ticks = max(ask_ticks, round(best_bid / tick) + 1)
-    return _price(bid_ticks, tick), _price(ask_ticks, tick)
+    bid_ticks: list[int] = []
+    ask_ticks: list[int] = []
+    for layer in range(config.layers):
+        offset = half_spread_bps * config.layer_spacing**layer / 10_000
+        bid = math.floor(reservation * (1 - offset) / tick + EPSILON)
+        ask = math.ceil(reservation * (1 + offset) / tick - EPSILON)
+        if layer == 0:
+            bid = min(bid, round(best_ask / tick) - 1)
+            ask = max(ask, round(best_bid / tick) + 1, bid + 1)
+        else:
+            bid = min(bid, bid_ticks[-1] - 1)
+            ask = max(ask, ask_ticks[-1] + 1)
+        bid_ticks.append(bid)
+        ask_ticks.append(ask)
+    return [_price(t, tick) for t in bid_ticks], [_price(t, tick) for t in ask_ticks]
 
 
 def tick_size(price: float) -> float:
     """Hyperliquid prices carry at most 5 significant figures."""
     return 10.0 ** (math.floor(math.log10(price)) - 4)
+
+
+def edge_bps(fill: Fill, mid: float) -> float:
+    """How far `mid` sits in the fill's favour, in bps of the fill price."""
+    sign = 1 if fill.side == "buy" else -1
+    return sign * (mid - fill.price) / fill.price * 10_000
+
+
+def _ladder(prices: list[float], config: Config, capacity: float) -> dict[int, tuple[float, float]]:
+    """Price and size per layer, growing outwards, filling inner layers first until capacity runs out."""
+    wanted = {}
+    for layer, price in enumerate(prices):
+        size = min(config.order_size * config.size_growth**layer, capacity)
+        if size <= EPSILON:
+            break
+        capacity -= size
+        wanted[layer] = (price, size)
+    return wanted
 
 
 def _price(ticks: int, tick: float) -> float:
@@ -268,9 +315,3 @@ def _price(ticks: int, tick: float) -> float:
 def _better(side: Side, price: float, than: float) -> bool:
     """Whether `price` is a strictly better price than `than` for a resting `side` order."""
     return price > than if side == "buy" else price < than
-
-
-def edge_bps(fill: Fill, mid: float) -> float:
-    """How far `mid` sits in the fill's favour, in bps of the fill price."""
-    sign = 1 if fill.side == "buy" else -1
-    return sign * (mid - fill.price) / fill.price * 10_000

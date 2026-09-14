@@ -106,11 +106,11 @@ async def _mm_messages(args: argparse.Namespace) -> AsyncIterator[dict]:
 
 
 def _status(coin: str, mm: MarketMaker) -> str:
-    quotes = "  ".join(
-        f"{side} {order.price:,.6g}" if (order := mm.orders[side]) else f"{side} -"
-        for side in ("buy", "sell")
+    quotes = "  ".join(_side_quotes(mm, side) for side in ("buy", "sell"))
+    markouts = " ".join(
+        f"mo{h / 1000:g}s {_mean([m.bps for m in mm.markouts if m.horizon_ms == h]):+.2f}"
+        for h in mm.config.markout_horizons_ms
     )
-    markouts = " ".join(f"mo{h / 1000:g}s {_mean(v):+.2f}" for h, v in mm.markouts.items())
     return (
         f"{_clock(mm.now_ms)}  {coin}  mid {mm.mid:,.6g}  [{quotes}]  "
         f"pos {mm.position:+.5f}  pnl {mm.pnl:+.2f}  fills {len(mm.fills)}  "
@@ -119,7 +119,14 @@ def _status(coin: str, mm: MarketMaker) -> str:
     )
 
 
+def _side_quotes(mm: MarketMaker, side: str) -> str:
+    """The inner price and how many layers are live, e.g. `buy 78,611 x3`."""
+    orders = sorted((o for o in mm.orders.values() if o.side == side), key=lambda o: o.layer)
+    return f"{side} {orders[0].price:,.6g} x{len(orders)}" if orders else f"{side} -"
+
+
 def _summary(mm: MarketMaker) -> str:
+    horizons = mm.config.markout_horizons_ms
     lines = [
         "",
         "--- summary ---",
@@ -128,9 +135,21 @@ def _summary(mm: MarketMaker) -> str:
         f"position       {mm.position:+.5f}",
         f"fees           ${mm.fees:,.4f}",
         f"pnl (at mid)   ${mm.pnl:+,.4f}",
-        f"edge at fill   {_mean([edge_bps(f, f.mid) for f in mm.fills]):+.2f} bps",
+        "",
+        "layer  fills     volume    edge  " + "  ".join(f"{f'mo{h / 1000:g}s':>6}" for h in horizons),
     ]
-    lines += [f"markout {h / 1000:g}s    {_mean(v):+.2f} bps  (n={len(v)})" for h, v in mm.markouts.items()]
+    for layer in sorted({f.layer for f in mm.fills}):
+        fills = [f for f in mm.fills if f.layer == layer]
+        markouts = [
+            _mean([m.bps for m in mm.markouts if m.fill.layer == layer and m.horizon_ms == h])
+            for h in horizons
+        ]
+        lines.append(
+            f"{layer:>5}  {len(fills):>5}  {sum(f.price * f.size for f in fills):>9,.0f}  "
+            f"{_mean([edge_bps(f, f.mid) for f in fills]):>+6.2f}  "
+            + "  ".join(f"{m:>+6.2f}" for m in markouts)
+        )
+    lines.append("(edge and markouts in bps; volume in $)")
     return "\n".join(lines)
 
 
