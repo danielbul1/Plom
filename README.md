@@ -24,7 +24,9 @@ Quotes both sides around the mid and simulates fills against the real book and t
 - **Pressure bias**: quotes shift `--pressure-skew-bps` towards book pressure once it crosses `--pressure-enter`, until it falls below `--pressure-exit`.
 - **Pickoff defense**: each side scores how far the mid moves against its fills `--pickoff-horizon-ms` later, reaching 1 at `--pickoff-full-bps`, decaying with `--pickoff-decay-s` while the side doesn't fill. A picked-off side quotes up to (1 + `--pickoff-spread-mult`) times further out and cuts its inner size by up to `--pickoff-size-cut`.
 - **One-sided in trends**: once the mid drifts `--trend-enter-z` expected moves over `--trend-window-s`, the side being run over is pulled (asks in an uptrend, bids in a downtrend) until the drift falls below `--trend-exit-z`.
-- **Execution**: orders go live after `--latency-ms`, requote at most every `--requote-interval-ms`, and a side pauses `--fill-cooldown-ms` after a fill.
+- **Jumps**: a book-to-book mid step of `--jump-bps`, or a trade that far through the mid, widens all quotes `--jump-spread-mult` times and scales sizes by `--jump-size-mult` for `--jump-hold-ms`. A trade jump also pulls the side it swept until the next book arrives.
+- **Cadence**: requote once the mid moves `--requote-move-bps` from where we last quoted, after `--requote-ttl-ms`, or after a fill or bias change, but no more often than `--requote-interval-ms`. Jumps and trend changes requote immediately.
+- **Execution**: orders go live after `--latency-ms`, and a side pauses `--fill-cooldown-ms` after a fill.
 - **Fills**: a trade through our price or the book crossing it fills the order; a trade at our price first eats the size queued ahead of us.
 
 ```bash

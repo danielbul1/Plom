@@ -136,6 +136,7 @@ def _summary(mm: MarketMaker) -> str:
         f"position       {mm.position:+.5f}",
         f"fees           ${mm.fees:,.4f}",
         f"pnl (at mid)   ${mm.pnl:+,.4f}",
+        f"jumps          {mm.jumps}",
         f"pulled         buy {mm.pulled_ms['buy'] / 1000:,.0f}s  sell {mm.pulled_ms['sell'] / 1000:,.0f}s",
         f"pickoff        buy {mm.pickoff_bps('buy'):+.2f}bps  sell {mm.pickoff_bps('sell'):+.2f}bps",
         "",

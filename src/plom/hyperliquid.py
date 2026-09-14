@@ -37,6 +37,9 @@ async def messages(coin: str, channels: Sequence[str] = CHANNELS) -> AsyncIterat
         try:
             for channel in channels:
                 subscription = {"type": channel, "coin": coin}
+                if channel == "l2Book":
+                    # Undocumented: without it books arrive every ~5s instead of every ~0.5s.
+                    subscription["fast"] = True
                 await ws.send(json.dumps({"method": "subscribe", "subscription": subscription}))
             async for raw in ws:
                 message = json.loads(raw)

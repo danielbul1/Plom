@@ -22,6 +22,8 @@ CONFIG = Config(
     pickoff_spread_mult=0,
     pickoff_size_cut=0,
     trend_enter_z=math.inf,
+    requote_move_bps=0,
+    jump_bps=math.inf,
 )
 # Three layers at 10 / 20 / 40 bps sized 1 / 2 / 4.
 LAYERED = replace(CONFIG, layers=3, layer_spacing=2.0, size_growth=2.0, max_position=10.0)
@@ -289,3 +291,80 @@ def test_trend_ends_when_drift_fades_and_asks_return():
     mm.on_book(book(2300, **flat))
     assert mm.trend == 0
     assert SELL in mm.pending
+
+
+CADENCE = replace(CONFIG, requote_move_bps=5, requote_ttl_ms=10_000)
+
+
+def test_small_mid_moves_do_not_requote():
+    mm = live_mm(CADENCE)
+    mm.on_book(book(200, bids=((100.01, 1.0),), asks=((100.03, 1.0),)))  # +2 bps
+    assert mm.pending == {}
+
+
+def test_mid_move_past_threshold_requotes():
+    mm = live_mm(CADENCE)
+    mm.on_book(book(200, bids=((100.09, 1.0),), asks=((100.11, 1.0),)))  # +10 bps
+    assert mm.pending[BUY].price == 99.99
+
+
+def test_quotes_refresh_after_ttl_even_without_a_move():
+    mm = live_mm(CADENCE)
+    moved = dict(bids=((100.01, 1.0),), asks=((100.03, 1.0),))
+    mm.on_book(book(9_000, **moved))
+    assert mm.pending == {}
+    mm.on_book(book(10_100, **moved))
+    assert mm.pending[BUY].price == 99.91
+
+
+def test_requote_interval_still_applies():
+    mm = live_mm(replace(CONFIG, requote_interval_ms=1000))
+    moved = dict(bids=((100.09, 1.0),), asks=((100.11, 1.0),))
+    mm.on_book(book(500, **moved))
+    assert mm.pending == {}
+    mm.on_book(book(1000, **moved))
+    assert BUY in mm.pending
+
+
+def test_fill_requotes_without_a_move():
+    mm = live_mm(CADENCE)
+    mm.on_trade(Trade(150, "sell", 99.50, 0.01))
+    mm.on_book(book(200))
+    assert mm.pending[BUY].price == 99.90
+
+
+JUMP = replace(CONFIG, jump_bps=5, jump_hold_ms=3000, jump_spread_mult=2.0, jump_size_mult=0.5)
+
+
+def test_book_jump_widens_and_shrinks_quotes_for_a_while():
+    mm = live_mm(JUMP)
+    jumped = dict(bids=((100.09, 1.0),), asks=((100.11, 1.0),))
+    mm.on_book(book(200, **jumped))  # +10 bps in one step
+    assert mm.is_jumping
+    assert mm.pending[BUY].price == 99.89
+    assert mm.pending[BUY].size == pytest.approx(0.5)
+    mm.on_book(book(3300, **jumped))
+    assert not mm.is_jumping
+    assert mm.pending[BUY].price == 99.99
+    assert mm.pending[BUY].size == pytest.approx(1.0)
+
+
+def test_sweep_pulls_the_swept_side_until_the_next_book():
+    mm = live_mm(replace(LAYERED, jump_bps=5, jump_spread_mult=2.0, jump_size_mult=0.5))
+    mm.on_trade(Trade(150, "sell", 99.70, 0.01))  # 30 bps through the mid
+    assert [f.layer for f in mm.fills] == [0, 1]
+    assert mm.swept["buy"]
+    assert mm.pending[("buy", 2)].size == 0
+    assert mm.pending[SELL].price == 100.20
+    assert mm.pending[SELL].size == pytest.approx(0.5)
+    mm.on_book(book(400))
+    assert not mm.swept["buy"]
+    assert mm.pending[BUY].price == 99.80
+
+
+def test_old_trades_do_not_count_as_jumps():
+    mm = live_mm(JUMP)
+    mm.on_book(book(3000))
+    mm.on_trade(Trade(1000, "sell", 99.00, 0.01))
+    assert not mm.is_jumping
+    assert not mm.swept["buy"]

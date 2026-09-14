@@ -64,6 +64,17 @@ class Config:
 
     latency_ms: int = 150
     requote_interval_ms: int = 500
+    """Minimum time between requotes, except urgent ones (a jump or a trend change)."""
+    requote_move_bps: float = 0.3
+    """Requote once the mid has moved this far from where we last quoted..."""
+    requote_ttl_ms: int = 5000
+    """...or after this long, or after a fill or bias change."""
+    jump_bps: float = 3.0
+    """A book-to-book mid step, or a trade this far through the mid, counts as a jump."""
+    jump_hold_ms: int = 3000
+    jump_spread_mult: float = 2.0
+    """How much wider all quotes sit for jump_hold_ms after a jump."""
+    jump_size_mult: float = 0.5
     fill_cooldown_ms: int = 1000
     maker_fee_bps: float = 0.0
     markout_horizons_ms: tuple[int, ...] = (1000, 5000)
@@ -119,9 +130,15 @@ class MarketMaker:
     orders: dict[Key, Order] = field(default_factory=dict)
     pending: dict[Key, Order] = field(default_factory=dict)
     pulled_ms: dict[Side, int] = field(default_factory=lambda: {"buy": 0, "sell": 0})
-    """Time each side spent pulled by the trend gate."""
+    """Time each side spent pulled by a trend or a sweep."""
+    swept: dict[Side, bool] = field(default_factory=lambda: {"buy": False, "sell": False})
+    """A trade jumped through this side since the last book, so its quotes are pulled until a fresh one."""
+    jumps: int = 0
 
     def __post_init__(self) -> None:
+        self._quoted_mid: float | None = None
+        self._dirty = False
+        self._jump_until_ms: int | None = None
         self._var_per_s = 0.0
         self._vol_ref: tuple[int, float] | None = None
         self._mids: deque[tuple[int, float]] = deque()
@@ -151,7 +168,12 @@ class MarketMaker:
         return min(1.0, max(0.0, self.pickoff_bps(side) / self.config.pickoff_full_bps))
 
     def is_pulled(self, side: Side) -> bool:
-        return (self.trend > 0 and side == "sell") or (self.trend < 0 and side == "buy")
+        running_over = (self.trend > 0 and side == "sell") or (self.trend < 0 and side == "buy")
+        return running_over or self.swept[side]
+
+    @property
+    def is_jumping(self) -> bool:
+        return self._jump_until_ms is not None and self.now_ms < self._jump_until_ms
 
     def on_book(self, book: Book) -> None:
         self.now_ms = max(self.now_ms, book.time_ms)
@@ -166,15 +188,34 @@ class MarketMaker:
                 if self.is_pulled(side):
                     self.pulled_ms[side] += self.now_ms - self._last_book_ms
         self._last_book_ms = self.now_ms
+        was_swept = any(self.swept.values())
+        self.swept = {"buy": False, "sell": False}
+        previous_mid, trend, bias = self.mid, self.trend, self.bias
         self._update_mid(book)
+        jumped = previous_mid is not None and abs(self.mid / previous_mid - 1) * 10_000 >= self.config.jump_bps
+        if jumped:
+            self._start_jump()
         self._update_trend()
         self._update_bias(book)
         self._settle_markouts()
-        self._requote()
+        if self.bias != bias:
+            self._dirty = True
+        self._maybe_requote(urgent=jumped or was_swept or self.trend != trend)
 
     def on_trade(self, trade: Trade) -> None:
+        stale = trade.time_ms + 1000 < self.now_ms
         self.now_ms = max(self.now_ms, trade.time_ms)
         self._activate_pending()
+        self._fill_from_trade(trade)
+        if stale or self.mid is None:
+            return
+        sign = 1 if trade.side == "buy" else -1
+        if sign * (trade.price / self.mid - 1) * 10_000 >= self.config.jump_bps:
+            self.swept["buy" if trade.side == "sell" else "sell"] = True
+            self._start_jump()
+            self._maybe_requote(urgent=True)
+
+    def _fill_from_trade(self, trade: Trade) -> None:
         resting: Side = "buy" if trade.side == "sell" else "sell"
         for order in sorted(
             (o for o in self.orders.values() if o.side == resting), key=lambda o: o.layer
@@ -231,6 +272,7 @@ class MarketMaker:
         for queue in self._unsettled.values():
             queue.append(fill)
         self._last_fill_ms[order.side] = self.now_ms
+        self._dirty = True
         order.size -= size
         key = (order.side, order.layer)
         if order.size <= EPSILON and self.orders.get(key) is order:
@@ -290,13 +332,33 @@ class MarketMaker:
                     alpha = 1 - 0.5 ** (1 / c.pickoff_half_life_fills)
                     adverse = (1 - alpha) * self.pickoff_bps(fill.side) + alpha * -markout.bps
                     self._pickoff[fill.side] = (adverse, self.now_ms)
+                    self._dirty = True
+
+    def _start_jump(self) -> None:
+        self.jumps += 1
+        self._jump_until_ms = self.now_ms + self.config.jump_hold_ms
+
+    def _maybe_requote(self, urgent: bool = False) -> None:
+        c = self.config
+        if self._jump_until_ms is not None and not self.is_jumping:
+            self._jump_until_ms = None
+            self._dirty = True
+        last = self._last_requote_ms
+        if not urgent and last is not None:
+            if self.now_ms - last < c.requote_interval_ms:
+                return
+            moved = abs(self.mid / self._quoted_mid - 1) * 10_000 >= c.requote_move_bps
+            if not (self._dirty or moved or self.now_ms - last >= c.requote_ttl_ms):
+                return
+        self._requote()
 
     def _requote(self) -> None:
         c = self.config
-        if self._last_requote_ms is not None and self.now_ms - self._last_requote_ms < c.requote_interval_ms:
-            return
         self._last_requote_ms = self.now_ms
-        half = half_spread_bps(self.vol_bps, c)
+        self._quoted_mid = self.mid
+        self._dirty = False
+        jump = self.is_jumping
+        half = half_spread_bps(self.vol_bps, c) * (c.jump_spread_mult if jump else 1.0)
         spreads = {side: half * (1 + c.pickoff_spread_mult * self.pickoff_score(side)) for side in SIDES}
         bids, asks = quotes(
             self.mid, self.book.bids[0][0], self.book.asks[0][0],
@@ -310,9 +372,11 @@ class MarketMaker:
             else:
                 last_fill = self._last_fill_ms[side]
                 if last_fill is not None and self.now_ms - last_fill < c.fill_cooldown_ms:
+                    self._dirty = True
                     continue
                 inner_size = 1 - c.pickoff_size_cut * self.pickoff_score(side)
-                wanted = _ladder(prices, c, capacity[side], inner_size)
+                size_mult = c.jump_size_mult if jump else 1.0
+                wanted = _ladder(prices, c, capacity[side], inner_size, size_mult)
             for key in {k for k in (*self.orders, *self.pending) if k[0] == side}:
                 current = self.pending.get(key) or self.orders.get(key)
                 if key[1] not in wanted and current.size > EPSILON:
@@ -378,17 +442,21 @@ def edge_bps(fill: Fill, mid: float) -> float:
 
 
 def _ladder(
-    prices: list[float], config: Config, capacity: float, inner_size: float = 1.0
+    prices: list[float],
+    config: Config,
+    capacity: float,
+    inner_size: float = 1.0,
+    size_mult: float = 1.0,
 ) -> dict[int, tuple[float, float]]:
     """Price and size per layer, growing outwards, filling inner layers first until capacity runs out.
 
-    inner_size scales the inner layer only.
+    inner_size scales the inner layer only; size_mult scales every layer.
     """
     wanted = {}
     for layer, price in enumerate(prices):
         if capacity <= EPSILON:
             break
-        scale = inner_size if layer == 0 else config.size_growth**layer
+        scale = (inner_size if layer == 0 else config.size_growth**layer) * size_mult
         size = min(config.order_size * scale, capacity)
         if size <= EPSILON:
             continue
