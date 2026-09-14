@@ -9,7 +9,7 @@ from dataclasses import fields, replace
 from pathlib import Path
 from statistics import fmean
 
-from plom import evaluate, recording
+from plom import evaluate, recording, runner
 from plom.market import Book, Trade
 from plom.mm import Config, MarketMaker, edge_bps
 from plom.pressure import DEFAULT_DEPTH, DEFAULT_HALF_LIFE_BPS, pressure
@@ -37,6 +37,10 @@ def main() -> None:
         help="fees, latencies, tick and rate limits (default: the venue's; `ideal` is free and unlimited)",
     )
     m.add_argument("--replay", type=Path, help="recording written by `plom record`")
+    m.add_argument(
+        "--reference", choices=[*VENUES, "none"], default="binance",
+        help="venue whose books pull fair value (default binance; none to quote on the venue alone)",
+    )
     m.add_argument("--status-every-s", type=float, default=5.0)
     m.add_argument("--block-s", type=float, default=evaluate.BLOCK_S, help="bootstrap block length")
     for f in fields(Config):
@@ -54,14 +58,25 @@ def main() -> None:
     k.add_argument("--venue", choices=[v for v in VENUES if v in DEFAULT_PROFILE])
     k.add_argument("--profile", choices=PROFILES)
     k.add_argument(
+        "--reference", choices=[*VENUES, "none"], default="binance",
+        help="venue whose books pull fair value (default binance; none to quote on the venue alone)",
+    )
+    k.add_argument(
         "--grid", action="append", default=[], metavar="FLAG=V1,V2,...",
         help="config values to try, e.g. --grid base-half-spread-bps=0.5,1,2; repeat to cross several",
     )
     k.add_argument("--block-s", type=float, default=evaluate.BLOCK_S)
     k.add_argument("--workers", type=int, default=os.cpu_count())
 
+    ll = commands.add_parser("leadlag", help="how far each venue's mid lags a reference, and how well the gap predicts catch-up")
+    ll.add_argument("replay", type=Path)
+    ll.add_argument("--reference", choices=VENUES, default="binance")
+    ll.add_argument("--venues", default="hyperliquid,lighter,orderly")
+
     args = parser.parse_args()
-    command = {"pressure": _pressure, "mm": _mm, "record": _record, "compare": _compare}[args.command]
+    command = {
+        "pressure": _pressure, "mm": _mm, "record": _record, "compare": _compare, "leadlag": _leadlag,
+    }[args.command]
     try:
         asyncio.run(command(args))
     except KeyboardInterrupt:
@@ -101,16 +116,15 @@ async def _mm(args: argparse.Namespace) -> None:
         f"latency {config.order_latency_ms}/{config.cancel_latency_ms}ms, {config.tx_per_minute} tx/min",
         flush=True,
     )
+    reference = None if args.reference in ("none", venue) else args.reference
     mm = MarketMaker(config)
     tracker = evaluate.Tracker(args.block_s)
-    events = _replay_events(args.replay, venue) if args.replay else _live_events(venue, args.coin)
+    dispatcher = runner.Dispatcher(mm)
+    events = _replay(args.replay, venue, reference) if args.replay else runner.live(venue, reference, args.coin)
     last_status_ms = None
     try:
-        async for event in events:
-            if isinstance(event, Book):
-                mm.on_book(event)
-            else:
-                mm.on_trade(event)
+        async for is_reference, recv_ms, event in events:
+            dispatcher.feed(is_reference, recv_ms, event)
             tracker.observe(mm)
             if mm.mid is None:
                 continue
@@ -139,10 +153,11 @@ async def _compare(args: argparse.Namespace) -> None:
         (" ".join(f"{name}={value}" for name, value in combo), replace(base, **dict(combo)))
         for combo in itertools.product(*axes)
     ]
-    print(f"{venue} ({profile_name}): {len(variants)} runs on {args.replay}", flush=True)
+    reference = None if args.reference in ("none", venue) else args.reference
+    print(f"{venue} ({profile_name}), reference {reference}: {len(variants)} runs on {args.replay}", flush=True)
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         futures = [
-            pool.submit(evaluate.replay, args.replay, venue, config, label, args.block_s)
+            pool.submit(evaluate.replay, args.replay, venue, config, label, args.block_s, reference)
             for label, config in variants
         ]
         results = [future.result() for future in futures]
@@ -159,19 +174,23 @@ async def _compare(args: argparse.Namespace) -> None:
         )
 
 
+async def _leadlag(args: argparse.Namespace) -> None:
+    from plom import leadlag
+
+    venues = [v for v in args.venues.split(",") if v != args.reference]
+    print(leadlag.format_report(args.reference, leadlag.measure(args.replay, args.reference, venues)))
+
+
+async def _replay(path: Path, venue: str, reference: str | None) -> AsyncIterator[runner.Event]:
+    for item in runner.replay(path, venue, reference):
+        yield item
+
+
 async def _live_events(venue: str, coin: str) -> AsyncIterator[Book | Trade]:
     parser = VENUES[venue].Parser()
     async for message in VENUES[venue].messages(coin):
         for event in parser.events(message):
             yield event
-
-
-async def _replay_events(path: Path, venue: str) -> AsyncIterator[Book | Trade]:
-    parser = VENUES[venue].Parser()
-    for recorded_venue, _, message in recording.read(path):
-        if recorded_venue == venue:
-            for event in parser.events(message):
-                yield event
 
 
 def _status(coin: str, mm: MarketMaker) -> str:

@@ -10,10 +10,8 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from plom import recording
-from plom.market import Book
+from plom import runner
 from plom.mm import Config, MarketMaker
-from plom.venues import VENUES
 
 BLOCK_S = 300
 BOOTSTRAP_SAMPLES = 2000
@@ -126,20 +124,21 @@ def evaluate(mm: MarketMaker, tracker: Tracker, label: str = "") -> Evaluation:
     )
 
 
-def replay(path: Path, venue: str, config: Config, label: str = "", block_s: float = BLOCK_S) -> Evaluation:
-    """Run a market maker over one venue's events in a recording and evaluate it."""
+def replay(
+    path: Path,
+    venue: str,
+    config: Config,
+    label: str = "",
+    block_s: float = BLOCK_S,
+    reference: str | None = None,
+) -> Evaluation:
+    """Run a market maker over one venue's events in a recording, optionally with a reference venue, and evaluate it."""
     mm = MarketMaker(config)
     tracker = Tracker(block_s)
-    parser = VENUES[venue].Parser()
-    for recorded_venue, _, message in recording.read(path):
-        if recorded_venue != venue:
-            continue
-        for event in parser.events(message):
-            if isinstance(event, Book):
-                mm.on_book(event)
-            else:
-                mm.on_trade(event)
-            tracker.observe(mm)
+    dispatcher = runner.Dispatcher(mm)
+    for is_reference, recv_ms, event in runner.replay(path, venue, reference):
+        dispatcher.feed(is_reference, recv_ms, event)
+        tracker.observe(mm)
     return evaluate(mm, tracker, label)
 
 

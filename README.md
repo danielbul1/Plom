@@ -22,6 +22,7 @@ Quotes both sides around the mid and simulates fills against the real book and t
 - **Spread**: the inner layer sits `--base-half-spread-bps` from the reservation price, widened to `--vol-multiplier` x one-second volatility when that is larger.
 - **Fair price**: quotes centre on the mid, moved `--microprice-weight` of the way to the microprice once top-of-book size imbalance reaches `--microprice-imbalance`.
 - **Regimes**: recent volatility over its `--vol-baseline-half-life-s` baseline. Below `--calm-below` is calm (tighter, bigger, slower TTL); above `--chaotic-above` is chaotic (wider, smaller, `--chaotic-layers` deeper-spaced layers with size backloaded harder, faster TTL). The `--calm-*` and `--chaotic-*` multipliers set how much.
+- **Reference price**: with `--reference binance` (the default), fair value moves `--reference-weight` of the way from the local price to the reference mid adjusted by a learned basis (`--basis-half-life-s`). Reference books are put on the venue's clock through our local receive time. A reference move of `--reference-jump-bps` within `--reference-jump-window-ms` pulls the side it runs towards until the venue's next book and widens quotes. `--reference none` quotes on the venue alone.
 - **Inventory skew**: quotes shift against the position by up to `--inventory-skew-bps` at `--max-position`.
 - **Pressure bias**: quotes shift `--pressure-skew-bps` towards book pressure once it crosses `--pressure-enter`, until it falls below `--pressure-exit`.
 - **Pickoff defense**: each side scores how far the mid moves against its fills `--pickoff-horizon-ms` later, reaching 1 at `--pickoff-full-bps`, decaying with `--pickoff-decay-s` while the side doesn't fill. A picked-off side quotes up to (1 + `--pickoff-spread-mult`) times further out and cuts its inner size by up to `--pickoff-size-cut`.
@@ -66,6 +67,14 @@ uv run plom compare data/btc.jsonl.gz --profile lighter-standard --grid base-hal
 ```
 
 `--grid FLAG=V1,V2` takes any config flag; repeated grids are crossed. An interval that straddles zero means the data can't tell yet.
+
+## Lead-lag
+
+`plom leadlag` measures, from a multi-venue recording, how far each venue's mid lags the reference (peak cross-correlation of mid returns on a 25ms grid of receive times), and how much of the basis-adjusted gap each venue closes over the next 250ms to 5s.
+
+```bash
+uv run plom leadlag data/btc.jsonl.gz
+```
 
 ## Recording
 

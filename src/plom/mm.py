@@ -51,6 +51,18 @@ class Config:
     microprice_weight: float = 1.0
     """How far to move from the mid towards the microprice: 0 is the mid, 1 is the microprice."""
 
+    reference_weight: float = 0.5
+    """With a reference venue, move fair value this far from the local price towards the reference
+    mid adjusted by the learned basis: 0 ignores the reference, 1 quotes around it."""
+    basis_half_life_s: float = 300.0
+    """How fast the learned venue-minus-reference basis adapts."""
+    reference_stale_ms: int = 1000
+    """Ignore the reference when its last book is older than this."""
+    reference_jump_bps: float = 2.0
+    """A reference move this large within reference_jump_window_ms counts as a jump and pulls the side
+    it runs towards until the venue's next book."""
+    reference_jump_window_ms: int = 250
+
     pickoff_horizon_ms: int = 1000
     """A fill is judged by how the mid moved this long after it."""
     pickoff_half_life_fills: float = 10.0
@@ -181,7 +193,12 @@ class MarketMaker:
     book: Book | None = None
     mid: float | None = None
     fair: float | None = None
-    """What we quote around: the mid, pulled towards the microprice when the top of book is lopsided."""
+    """What we quote around: the mid pulled towards the microprice when the top of book is lopsided,
+    then towards the basis-adjusted reference when there is one."""
+    local_fair: float | None = None
+    reference_mid: float | None = None
+    reference_ms: int | None = None
+    reference_jumps: int = 0
     regime: Regime = "normal"
     pressure: float = 0.0
     bias: int = 0
@@ -225,6 +242,9 @@ class MarketMaker:
         self._last_requote_ms: int | None = None
         self._last_fill_ms: dict[Side, int | None] = {"buy": None, "sell": None}
         self._pickoff: dict[Side, tuple[float, int]] = {"buy": (0.0, 0), "sell": (0.0, 0)}
+        self._basis = _TimeEwma(self.config.basis_half_life_s)
+        self._basis_ms: int | None = None
+        self._reference_mids: deque[tuple[int, float]] = deque()
         horizons = {*self.config.markout_horizons_ms, self.config.pickoff_horizon_ms}
         self._unsettled: dict[int, deque[Fill]] = {h: deque() for h in horizons}
 
@@ -257,6 +277,15 @@ class MarketMaker:
         return running_over or self.swept[side]
 
     @property
+    def basis(self) -> float | None:
+        """Learned log(venue mid / reference mid)."""
+        return self._basis.mean if self._basis_ms is not None else None
+
+    @property
+    def reference_fresh(self) -> bool:
+        return self.reference_ms is not None and self.now_ms - self.reference_ms <= self.config.reference_stale_ms
+
+    @property
     def is_jumping(self) -> bool:
         return self._jump_until_ms is not None and self.now_ms < self._jump_until_ms
 
@@ -279,7 +308,9 @@ class MarketMaker:
         self.swept = {"buy": False, "sell": False}
         previous_mid, trend, bias, regime = self.mid, self.trend, self.bias, self.regime
         self._update_mid(book)
-        self.fair = fair_price(book, self.config)
+        self.local_fair = fair_price(book, self.config)
+        self._update_basis()
+        self._update_fair()
         self.regime = classify_regime(self.vol_ratio, self.config)
         jumped = previous_mid is not None and abs(self.mid / previous_mid - 1) * 10_000 >= self.config.jump_bps
         if jumped:
@@ -291,6 +322,49 @@ class MarketMaker:
             self._dirty = True
         turned_chaotic = self.regime == "chaotic" and regime != "chaotic"
         self._maybe_requote(urgent=jumped or was_swept or turned_chaotic or self.trend != trend)
+
+    def on_reference(self, book: Book) -> None:
+        """A book from the reference venue, with time_ms already translated to this venue's clock."""
+        if not book.bids or not book.asks:
+            return
+        self.now_ms = max(self.now_ms, book.time_ms)
+        self._activate_pending()
+        self.reference_mid = (book.bids[0][0] + book.asks[0][0]) / 2
+        self.reference_ms = self.now_ms
+        c = self.config
+        window = self._reference_mids
+        window.append((self.now_ms, self.reference_mid))
+        while len(window) > 1 and window[1][0] <= self.now_ms - c.reference_jump_window_ms:
+            window.popleft()
+        move_bps = (self.reference_mid / window[0][1] - 1) * 10_000
+        jumped = abs(move_bps) >= c.reference_jump_bps
+        if jumped:
+            self.reference_jumps += 1
+            self.swept["sell" if move_bps > 0 else "buy"] = True
+            self._start_jump()
+            window.clear()
+            window.append((self.now_ms, self.reference_mid))
+        if self.book is None or self.mid is None:
+            return
+        self._update_fair()
+        self._maybe_requote(urgent=jumped)
+
+    def _update_basis(self) -> None:
+        if not self.reference_fresh:
+            return
+        dt_s = 0.0 if self._basis_ms is None else (self.now_ms - self._basis_ms) / 1000
+        if self._basis_ms is None:
+            self._basis.add(math.log(self.mid / self.reference_mid), 1.0)
+        elif dt_s > 0:
+            self._basis.add(math.log(self.mid / self.reference_mid), dt_s)
+        self._basis_ms = self.now_ms
+
+    def _update_fair(self) -> None:
+        self.fair = self.local_fair
+        if self.basis is None or not self.reference_fresh or self.local_fair is None:
+            return
+        adjusted = self.reference_mid * math.exp(self.basis)
+        self.fair = self.local_fair + self.config.reference_weight * (adjusted - self.local_fair)
 
     def on_trade(self, trade: Trade) -> None:
         stale = trade.time_ms + 1000 < self.now_ms
