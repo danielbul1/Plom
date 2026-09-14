@@ -1,30 +1,66 @@
-"""Live L2 order books from Hyperliquid's public WebSocket (no auth needed)."""
+"""Hyperliquid's public WebSocket: live L2 books and trades (no auth needed)."""
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
+from dataclasses import dataclass
+from typing import Literal
 
 import websockets
 
 from plom.pressure import Level
 
 WS_URL = "wss://api.hyperliquid.xyz/ws"
+CHANNELS = ("l2Book", "trades")
 
 
-async def l2_books(coin: str) -> AsyncIterator[tuple[list[Level], list[Level]]]:
-    """Yield (bids, asks) for every book update, reconnecting if the socket drops."""
-    subscribe = {"method": "subscribe", "subscription": {"type": "l2Book", "coin": coin}}
+@dataclass(frozen=True)
+class Book:
+    time_ms: int
+    bids: list[Level]
+    """Best (highest) first."""
+    asks: list[Level]
+    """Best (lowest) first."""
+
+
+@dataclass(frozen=True)
+class Trade:
+    time_ms: int
+    side: Literal["buy", "sell"]
+    """The aggressor's side: a "sell" trade hit resting bids."""
+    price: float
+    size: float
+
+
+async def messages(coin: str, channels: Sequence[str] = CHANNELS) -> AsyncIterator[dict]:
+    """Yield raw channel messages, reconnecting if the socket drops."""
     async for ws in websockets.connect(WS_URL):
         try:
-            await ws.send(json.dumps(subscribe))
+            for channel in channels:
+                subscription = {"type": channel, "coin": coin}
+                await ws.send(json.dumps({"method": "subscribe", "subscription": subscription}))
             async for raw in ws:
                 message = json.loads(raw)
-                if message.get("channel") != "l2Book":
-                    continue
-                bids, asks = message["data"]["levels"]
-                yield _parse(bids), _parse(asks)
+                if message.get("channel") in channels:
+                    yield message
         except websockets.ConnectionClosed:
             continue
 
 
-def _parse(levels: list[dict]) -> list[Level]:
+def events(message: dict) -> list[Book | Trade]:
+    """Parse a raw channel message. Trade messages can carry several trades."""
+    data = message["data"]
+    match message["channel"]:
+        case "l2Book":
+            bids, asks = data["levels"]
+            return [Book(data["time"], _levels(bids), _levels(asks))]
+        case "trades":
+            return [
+                Trade(t["time"], "buy" if t["side"] == "B" else "sell", float(t["px"]), float(t["sz"]))
+                for t in data
+            ]
+        case _:
+            return []
+
+
+def _levels(levels: list[dict]) -> list[Level]:
     return [(float(level["px"]), float(level["sz"])) for level in levels]
