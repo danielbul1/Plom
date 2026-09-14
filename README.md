@@ -22,6 +22,8 @@ Quotes both sides around the mid and simulates fills against the real book and t
 - **Spread**: the inner layer sits `--base-half-spread-bps` from the reservation price, widened to `--vol-multiplier` x one-second volatility when that is larger.
 - **Inventory skew**: quotes shift against the position by up to `--inventory-skew-bps` at `--max-position`.
 - **Pressure bias**: quotes shift `--pressure-skew-bps` towards book pressure once it crosses `--pressure-enter`, until it falls below `--pressure-exit`.
+- **Pickoff defense**: each side scores how far the mid moves against its fills `--pickoff-horizon-ms` later, reaching 1 at `--pickoff-full-bps`, decaying with `--pickoff-decay-s` while the side doesn't fill. A picked-off side quotes up to (1 + `--pickoff-spread-mult`) times further out and cuts its inner size by up to `--pickoff-size-cut`.
+- **One-sided in trends**: once the mid drifts `--trend-enter-z` expected moves over `--trend-window-s`, the side being run over is pulled (asks in an uptrend, bids in a downtrend) until the drift falls below `--trend-exit-z`.
 - **Execution**: orders go live after `--latency-ms`, requote at most every `--requote-interval-ms`, and a side pauses `--fill-cooldown-ms` after a fill.
 - **Fills**: a trade through our price or the book crossing it fills the order; a trade at our price first eats the size queued ahead of us.
 

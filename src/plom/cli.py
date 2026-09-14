@@ -115,7 +115,8 @@ def _status(coin: str, mm: MarketMaker) -> str:
         f"{_clock(mm.now_ms)}  {coin}  mid {mm.mid:,.6g}  [{quotes}]  "
         f"pos {mm.position:+.5f}  pnl {mm.pnl:+.2f}  fills {len(mm.fills)}  "
         f"edge {_mean([edge_bps(f, f.mid) for f in mm.fills]):+.2f}bps  {markouts}  "
-        f"vol {mm.vol_bps:.2f}bps  bias {mm.bias:+d}"
+        f"vol {mm.vol_bps:.2f}bps  bias {mm.bias:+d}  trend {mm.trend:+d}  "
+        f"pickoff b{mm.pickoff_score('buy'):.2f}/s{mm.pickoff_score('sell'):.2f}"
     )
 
 
@@ -135,6 +136,8 @@ def _summary(mm: MarketMaker) -> str:
         f"position       {mm.position:+.5f}",
         f"fees           ${mm.fees:,.4f}",
         f"pnl (at mid)   ${mm.pnl:+,.4f}",
+        f"pulled         buy {mm.pulled_ms['buy'] / 1000:,.0f}s  sell {mm.pulled_ms['sell'] / 1000:,.0f}s",
+        f"pickoff        buy {mm.pickoff_bps('buy'):+.2f}bps  sell {mm.pickoff_bps('sell'):+.2f}bps",
         "",
         "layer  fills     volume    edge  " + "  ".join(f"{f'mo{h / 1000:g}s':>6}" for h in horizons),
     ]

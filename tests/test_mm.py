@@ -1,9 +1,10 @@
+import math
 from dataclasses import replace
 
 import pytest
 
 from plom.hyperliquid import Book, Trade
-from plom.mm import Config, MarketMaker, quotes, tick_size
+from plom.mm import Config, MarketMaker, half_spread_bps, quotes, skew_bps, tick_size
 
 # One layer, mid 100, tick 0.01, 10 bps half spread: quotes at 99.90 / 100.10.
 CONFIG = Config(
@@ -18,6 +19,9 @@ CONFIG = Config(
     requote_interval_ms=0,
     fill_cooldown_ms=0,
     markout_horizons_ms=(1000,),
+    pickoff_spread_mult=0,
+    pickoff_size_cut=0,
+    trend_enter_z=math.inf,
 )
 # Three layers at 10 / 20 / 40 bps sized 1 / 2 / 4.
 LAYERED = replace(CONFIG, layers=3, layer_spacing=2.0, size_growth=2.0, max_position=10.0)
@@ -38,47 +42,50 @@ def live_mm(config=CONFIG, **book_kwargs):
 
 
 def test_quotes_are_symmetric_without_skew():
-    assert quotes(100.0, 99.99, 100.01, 0.0, 0.0, 0, CONFIG) == ([99.90], [100.10])
+    assert quotes(100.0, 99.99, 100.01, 0, 10, 10, CONFIG) == ([99.90], [100.10])
 
 
-def test_long_inventory_shifts_quotes_down():
+def test_long_inventory_skews_down():
     config = replace(CONFIG, inventory_skew_bps=5)
-    assert quotes(100.0, 99.99, 100.01, 0.0, 5.0, 0, config) == ([99.85], [100.05])
+    assert skew_bps(5.0, 0, config) == -5
+    assert quotes(100.0, 99.99, 100.01, -5, 10, 10, config) == ([99.85], [100.05])
 
 
-def test_bias_shifts_quotes_towards_pressure():
+def test_bias_skews_towards_pressure():
     config = replace(CONFIG, pressure_skew_bps=5)
+    assert skew_bps(0.0, 1, config) == 5
     # Reservation 100.05; +-10 bps of it is 99.94995 / 100.15005, rounded away from the mid.
-    assert quotes(100.0, 99.99, 100.01, 0.0, 0.0, 1, config) == ([99.94], [100.16])
+    assert quotes(100.0, 99.99, 100.01, 5, 10, 10, config) == ([99.94], [100.16])
+
+
+def test_sides_can_have_different_half_spreads():
+    assert quotes(100.0, 99.99, 100.01, 0, 20, 10, CONFIG) == ([99.80], [100.10])
 
 
 def test_quotes_never_cross_the_book():
-    config = replace(CONFIG, base_half_spread_bps=0, pressure_skew_bps=50)
-    bids, _ = quotes(100.0, 99.99, 100.01, 0.0, 0.0, 1, config)
+    bids, _ = quotes(100.0, 99.99, 100.01, 50, 0, 0, CONFIG)
     assert bids == [100.00]
 
 
 def test_zero_spread_quotes_never_cross_each_other():
-    config = replace(CONFIG, base_half_spread_bps=0)
-    bids, asks = quotes(100.0, 99.99, 100.01, 0.0, 0.0, 0, config)
+    bids, asks = quotes(100.0, 99.99, 100.01, 0, 0, 0, CONFIG)
     assert bids[0] < asks[0]
 
 
 def test_volatility_widens_the_spread():
-    config = replace(CONFIG, vol_multiplier=2)
-    assert quotes(100.0, 99.99, 100.01, 10.0, 0.0, 0, config) == ([99.80], [100.20])
+    assert half_spread_bps(10.0, replace(CONFIG, vol_multiplier=2)) == 20
+    assert half_spread_bps(1.0, replace(CONFIG, vol_multiplier=2)) == 10
 
 
 def test_layers_move_outwards_geometrically():
-    assert quotes(100.0, 99.99, 100.01, 0.0, 0.0, 0, LAYERED) == (
+    assert quotes(100.0, 99.99, 100.01, 0, 10, 10, LAYERED) == (
         [99.90, 99.80, 99.60],
         [100.10, 100.20, 100.40],
     )
 
 
 def test_layers_never_share_a_price():
-    config = replace(LAYERED, base_half_spread_bps=0)
-    bids, asks = quotes(100.0, 99.99, 100.01, 0.0, 0.0, 0, config)
+    bids, asks = quotes(100.0, 99.99, 100.01, 0, 0, 0, LAYERED)
     assert bids == [100.00, 99.99, 99.98]
     assert asks == [100.01, 100.02, 100.03]
 
@@ -206,3 +213,79 @@ def test_fewer_layers_cancels_the_outer_ones():
     mm.on_book(book(200))
     mm.on_book(book(300))
     assert set(mm.orders) == {BUY, SELL}
+
+
+PICKOFF = replace(
+    CONFIG, pickoff_spread_mult=1.0, pickoff_size_cut=0.5, pickoff_full_bps=2.0, pickoff_half_life_fills=1.0
+)
+
+
+def picked_off_bid(config=PICKOFF):
+    """Our bid at 99.90 fills, then the mid drops to 99.50 a second later (-40 bps markout)."""
+    mm = live_mm(config)
+    mm.on_trade(Trade(150, "sell", 99.50, 0.01))
+    mm.on_book(book(1150, bids=((99.49, 1.0),), asks=((99.51, 1.0),)))
+    return mm
+
+
+def test_picked_off_side_scores_adverse_markouts():
+    mm = picked_off_bid()
+    assert mm.pickoff_bps("buy") == pytest.approx(0.5 * (99.90 - 99.50) / 99.90 * 10_000)
+    assert mm.pickoff_score("buy") == 1.0
+    assert mm.pickoff_score("sell") == 0.0
+
+
+def test_picked_off_side_quotes_wider_and_smaller():
+    mm = picked_off_bid()
+    # Mid 99.50 (tick 0.001): the bid side doubles its 10 bps half spread, the ask side keeps it.
+    assert mm.pending[BUY].price == 99.301
+    assert mm.pending[BUY].size == pytest.approx(0.5)
+    assert mm.pending[SELL].price == 99.60
+    assert mm.pending[SELL].size == pytest.approx(1.0)
+
+
+def test_pickoff_score_decays_without_new_fills():
+    mm = picked_off_bid(replace(PICKOFF, pickoff_decay_s=1.0))
+    before = mm.pickoff_bps("buy")
+    mm.on_book(book(2150, bids=((99.49, 1.0),), asks=((99.51, 1.0),)))
+    assert mm.pickoff_bps("buy") == pytest.approx(before / 2)
+
+
+def test_favourable_markouts_do_not_widen():
+    mm = live_mm(PICKOFF)
+    mm.on_trade(Trade(150, "sell", 99.50, 0.01))
+    mm.on_book(book(1150, bids=((100.49, 1.0),), asks=((100.51, 1.0),)))
+    assert mm.pickoff_bps("buy") < 0
+    assert mm.pickoff_score("buy") == 0.0
+
+
+TREND = replace(CONFIG, trend_window_s=1.0, trend_enter_z=2.0, trend_exit_z=1.0, trend_floor_bps=1.0)
+
+
+def test_uptrend_pulls_asks_and_keeps_bids():
+    mm = live_mm(TREND)
+    mm.on_book(book(1100, bids=((100.09, 1.0),), asks=((100.11, 1.0),)))  # +10 bps in a second
+    assert mm.trend == 1
+    mm.on_book(book(1250, bids=((100.09, 1.0),), asks=((100.11, 1.0),)))
+    assert BUY in mm.orders
+    assert SELL not in mm.orders
+    assert mm.pulled_ms["sell"] == 150
+
+
+def test_downtrend_pulls_bids():
+    mm = live_mm(TREND)
+    mm.on_book(book(1100, bids=((99.89, 1.0),), asks=((99.91, 1.0),)))
+    assert mm.trend == -1
+    mm.on_book(book(1250, bids=((99.89, 1.0),), asks=((99.91, 1.0),)))
+    assert BUY not in mm.orders
+    assert SELL in mm.orders
+
+
+def test_trend_ends_when_drift_fades_and_asks_return():
+    mm = live_mm(TREND)
+    flat = dict(bids=((100.09, 1.0),), asks=((100.11, 1.0),))
+    mm.on_book(book(1100, **flat))
+    mm.on_book(book(1250, **flat))
+    mm.on_book(book(2300, **flat))
+    assert mm.trend == 0
+    assert SELL in mm.pending
