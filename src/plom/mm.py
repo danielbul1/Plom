@@ -11,7 +11,7 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
-from plom.hyperliquid import Book, Trade
+from plom.market import Book, Trade
 from plom.pressure import pressure
 
 Side = Literal["buy", "sell"]

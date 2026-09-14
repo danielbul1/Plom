@@ -9,7 +9,7 @@ Ranges from -1 (all weight on the ask) to +1 (all weight on the bid).
 
 ```bash
 uv run plom pressure BTC
-uv run plom pressure ETH --depth 12 --half-life-bps 5
+uv run plom pressure ETH --venue lighter --depth 12 --half-life-bps 5
 ```
 
 `--half-life-bps` sets how fast weight decays with distance from the mid: a level that far away counts half.
@@ -40,12 +40,24 @@ uv run plom mm --help
 Output: position, PnL marked at mid, fills, **edge** (fill price vs mid at fill) and **markouts** (mid 1s / 5s after the fill vs fill price).
 Edge minus markout decay is the adverse selection. Ctrl+C prints a summary broken down per layer.
 
-Record live data once and replay it to compare settings:
+## Recording
+
+`plom record` saves raw books and trades from several venues into one file, each line tagged with the venue and our local receive time (the only clock shared across venues). A `.gz` path compresses it.
+
+| Venue | Book | Trades | Notes |
+|---|---|---|---|
+| `hyperliquid` | full L2 snapshots, ~0.5s | all | subscribes with the undocumented `fast` flag |
+| `binance` | top of book, first update per 50ms | aggregated | USD-M futures, used as a reference price |
+| `lighter` | snapshot + deltas, ~50ms | all, incl. liquidations | local book rebuilt from nonce-chained deltas |
+| `orderly` | snapshot + deltas, ~200ms | all | local book rebuilt from `prevTs`-chained deltas |
 
 ```bash
-uv run plom record BTC btc.jsonl
-uv run plom mm BTC --replay btc.jsonl --base-half-spread-bps 1
+uv run plom record BTC data/btc.jsonl.gz
+uv run plom record BTC data/btc.jsonl.gz --venues hyperliquid,binance
+uv run plom mm BTC --replay data/btc.jsonl.gz --venue lighter
 ```
+
+Replays pick one venue with `--venue` (default `hyperliquid`). Older Hyperliquid-only recordings still replay.
 
 Caveats: our orders never move the real market, queue position is estimated from visible size, and latency is a fixed guess.
 

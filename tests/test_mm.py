@@ -3,7 +3,7 @@ from dataclasses import replace
 
 import pytest
 
-from plom.hyperliquid import Book, Trade
+from plom.market import Book, Trade
 from plom.mm import (
     Config,
     MarketMaker,

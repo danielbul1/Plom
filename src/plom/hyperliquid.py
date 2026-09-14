@@ -2,33 +2,14 @@
 
 import json
 from collections.abc import AsyncIterator, Sequence
-from dataclasses import dataclass
-from typing import Literal
 
 import websockets
 
-from plom.pressure import Level
+from plom.market import Book, Level, Trade
 
+NAME = "hyperliquid"
 WS_URL = "wss://api.hyperliquid.xyz/ws"
 CHANNELS = ("l2Book", "trades")
-
-
-@dataclass(frozen=True)
-class Book:
-    time_ms: int
-    bids: list[Level]
-    """Best (highest) first."""
-    asks: list[Level]
-    """Best (lowest) first."""
-
-
-@dataclass(frozen=True)
-class Trade:
-    time_ms: int
-    side: Literal["buy", "sell"]
-    """The aggressor's side: a "sell" trade hit resting bids."""
-    price: float
-    size: float
 
 
 async def messages(coin: str, channels: Sequence[str] = CHANNELS) -> AsyncIterator[dict]:
@@ -47,6 +28,13 @@ async def messages(coin: str, channels: Sequence[str] = CHANNELS) -> AsyncIterat
                     yield message
         except websockets.ConnectionClosed:
             continue
+
+
+class Parser:
+    """Every Hyperliquid book message is a full snapshot, so nothing carries over between messages."""
+
+    def events(self, message: dict) -> list[Book | Trade]:
+        return events(message)
 
 
 def events(message: dict) -> list[Book | Trade]:

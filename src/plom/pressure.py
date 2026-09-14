@@ -3,8 +3,7 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-Level = tuple[float, float]
-"""A book level as (price, size)."""
+from plom.market import Level
 
 DEFAULT_DEPTH = 12
 DEFAULT_HALF_LIFE_BPS = 5.0
