@@ -10,6 +10,7 @@ from plom import recording
 from plom.market import Book, Trade
 from plom.mm import Config, MarketMaker, edge_bps
 from plom.pressure import DEFAULT_DEPTH, DEFAULT_HALF_LIFE_BPS, pressure
+from plom.profiles import DEFAULT_PROFILE, PROFILES
 from plom.venues import VENUES
 
 BAR_WIDTH = 20
@@ -27,12 +28,16 @@ def main() -> None:
 
     m = commands.add_parser("mm", help="paper market maker on the live book or a recording")
     m.add_argument("coin", nargs="?", default="BTC")
-    m.add_argument("--venue", choices=VENUES, default="hyperliquid", help="the venue to quote on")
+    m.add_argument("--venue", choices=[v for v in VENUES if v in DEFAULT_PROFILE], help="the venue to quote on")
+    m.add_argument(
+        "--profile", choices=PROFILES,
+        help="fees, latencies, tick and rate limits (default: the venue's; `ideal` is free and unlimited)",
+    )
     m.add_argument("--replay", type=Path, help="recording written by `plom record`")
     m.add_argument("--status-every-s", type=float, default=5.0)
     for f in fields(Config):
         if isinstance(f.default, int | float):
-            m.add_argument("--" + f.name.replace("_", "-"), type=type(f.default), default=f.default)
+            m.add_argument("--" + f.name.replace("_", "-"), type=type(f.default), help=f"default {f.default}")
 
     r = commands.add_parser("record", help="save live books and trades from several venues to one file")
     r.add_argument("coin")
@@ -72,11 +77,17 @@ async def _record(args: argparse.Namespace) -> None:
 
 
 async def _mm(args: argparse.Namespace) -> None:
-    config = replace(Config(), **{
-        f.name: getattr(args, f.name) for f in fields(Config) if hasattr(args, f.name)
-    })
+    profile = PROFILES[args.profile or DEFAULT_PROFILE[args.venue or "hyperliquid"]]
+    venue = args.venue or profile.venue
+    explicit = {f.name: getattr(args, f.name) for f in fields(Config) if getattr(args, f.name, None) is not None}
+    config = replace(Config(), **{**profile.config, **explicit})
+    print(
+        f"{venue} ({args.profile or DEFAULT_PROFILE[venue]}): maker {config.maker_fee_bps}bps, "
+        f"latency {config.order_latency_ms}/{config.cancel_latency_ms}ms, {config.tx_per_minute} tx/min",
+        flush=True,
+    )
     mm = MarketMaker(config)
-    events = _replay_events(args.replay, args.venue) if args.replay else _live_events(args.venue, args.coin)
+    events = _replay_events(args.replay, venue) if args.replay else _live_events(venue, args.coin)
     last_status_ms = None
     try:
         async for event in events:
@@ -140,6 +151,7 @@ def _summary(mm: MarketMaker) -> str:
         f"fees           ${mm.fees:,.4f}",
         f"pnl (at mid)   ${mm.pnl:+,.4f}",
         f"jumps          {mm.jumps}",
+        f"transactions   {mm.tx_sent:,} sent, {mm.tx_skipped:,} skipped by the rate limit",
         "regime time    " + "  ".join(f"{r} {ms / 1000:,.0f}s" for r, ms in mm.regime_ms.items()),
         f"pulled         buy {mm.pulled_ms['buy'] / 1000:,.0f}s  sell {mm.pulled_ms['sell'] / 1000:,.0f}s",
         f"pickoff        buy {mm.pickoff_bps('buy'):+.2f}bps  sell {mm.pickoff_bps('sell'):+.2f}bps",

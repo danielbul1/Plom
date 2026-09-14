@@ -28,12 +28,25 @@ Quotes both sides around the mid and simulates fills against the real book and t
 - **One-sided in trends**: once the mid drifts `--trend-enter-z` expected moves over `--trend-window-s`, the side being run over is pulled (asks in an uptrend, bids in a downtrend) until the drift falls below `--trend-exit-z`.
 - **Jumps**: a book-to-book mid step of `--jump-bps`, or a trade that far through the mid, widens all quotes `--jump-spread-mult` times and scales sizes by `--jump-size-mult` for `--jump-hold-ms`. A trade jump also pulls the side it swept until the next book arrives.
 - **Cadence**: requote once the mid moves `--requote-move-bps` from where we last quoted, after `--requote-ttl-ms`, or after a fill or bias change, but no more often than `--requote-interval-ms`. Jumps and trend changes requote immediately.
-- **Execution**: orders go live after `--latency-ms`, and a side pauses `--fill-cooldown-ms` after a fill.
-- **Fills**: a trade through our price or the book crossing it fills the order; a trade at our price first eats the size queued ahead of us.
+- **Execution**: orders rest after `--order-latency-ms`; a replaced or cancelled order stays fillable for `--cancel-latency-ms`. Placements, replacements and cancels beyond `--tx-per-minute` are skipped. A side pauses `--fill-cooldown-ms` after a fill.
+- **Fills**: a trade through our price fills us up to the trade's size, and the opposite book reaching our price fills us up to the size resting there. A trade at our price first eats the size queued ahead of us. Size that leaves our level without trading is assumed to leave from behind us, unless `--queue-power` n > 0 splits it ahead/behind as front^n : back^n (hftbacktest's power probability queue model).
+
+### Venue profiles
+
+`--profile` sets fees, latencies, tick size and rate limits for a venue (see `src/plom/profiles.py` for sources). Without one, `--venue` picks its default; any explicit flag overrides the profile.
+
+| Profile | Venue | Maker / taker | Order / cancel latency | Tx per minute |
+|---|---|---|---|---|
+| `ideal` | hyperliquid | 0 / 0 | 150 / 150ms | unlimited |
+| `hyperliquid` | hyperliquid | 1.5 / 4.5 bps | 150 / 150ms | unlimited |
+| `lighter-standard` | lighter | 0 / 0 | 350 / 450ms | 60 |
+| `lighter-premium` | lighter | 0.4 / 2.8 bps | 150 / 150ms | 4,000 |
+| `orderly-raydium` | orderly | 0 / 4.5 bps | 150 / 150ms | 600 |
 
 ```bash
 uv run plom mm BTC
-uv run plom mm BTC --maker-fee-bps 1.5 --latency-ms 250
+uv run plom mm BTC --replay data/btc.jsonl.gz --profile lighter-standard
+uv run plom mm BTC --profile hyperliquid --order-latency-ms 250 --queue-power 2
 uv run plom mm --help
 ```
 
@@ -59,7 +72,7 @@ uv run plom mm BTC --replay data/btc.jsonl.gz --venue lighter
 
 Replays pick one venue with `--venue` (default `hyperliquid`). Older Hyperliquid-only recordings still replay.
 
-Caveats: our orders never move the real market, queue position is estimated from visible size, and latency is a fixed guess.
+Caveats: our orders never move the real market, queue position is estimated from visible (aggregated) size, and latencies are fixed estimates until measured against live orders.
 
 ## Tests
 

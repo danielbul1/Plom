@@ -1,8 +1,11 @@
 """Paper market maker: quotes around the mid and simulates its fills against the real tape.
 
-Nothing is sent to the exchange. Fills are inferred from public data:
-- a trade through our price, or the opposite side of the book reaching it, fills the whole order;
-- a trade at our price first eats the visible size that was queued ahead of us.
+Nothing is sent to the exchange. Fills are inferred from public data, conservatively:
+- a trade through our price fills us up to the trade's size; the opposite side of the book reaching
+  our price fills us up to the size resting there;
+- a trade at our price first eats the visible size queued ahead of us;
+- an order rests only after order_latency_ms, and a replaced or cancelled one stays fillable for
+  cancel_latency_ms.
 Our orders don't move the real market, so results are optimistic for sizes that would.
 """
 
@@ -84,7 +87,17 @@ class Config:
     chaotic_size_growth_mult: float = 1.5
     """Backload size harder in chaos: layers grow faster away from the touch."""
 
-    latency_ms: int = 150
+    tick_size: float = 0.0
+    """Price increment; 0 uses Hyperliquid's five-significant-figure rule."""
+    order_latency_ms: int = 150
+    """From deciding to quote until the order rests on the book."""
+    cancel_latency_ms: int = 150
+    """From deciding to cancel or replace until the old order stops being fillable."""
+    tx_per_minute: float = math.inf
+    """Placements, replacements and cancels allowed per minute; actions beyond it are skipped."""
+    queue_power: float = 0.0
+    """0 assumes size leaving our level without trading left from behind us. Above 0, it is split
+    ahead of and behind us in proportion front**n : back**n, as in hftbacktest's power queue model."""
     requote_interval_ms: int = 500
     """Minimum time between requotes, except urgent ones (a jump or a trend change)."""
     requote_move_bps: float = 0.3
@@ -99,6 +112,7 @@ class Config:
     jump_size_mult: float = 0.5
     fill_cooldown_ms: int = 1000
     maker_fee_bps: float = 0.0
+    taker_fee_bps: float = 0.0
     markout_horizons_ms: tuple[int, ...] = (1000, 5000)
 
 
@@ -110,7 +124,16 @@ class Order:
     size: float
     """Remaining size. A pending order with size 0 is a cancel."""
     live_from_ms: int
+    dead_from_ms: float = math.inf
+    """When a cancel or replacement takes effect; the order is fillable in [live_from_ms, dead_from_ms)."""
     queue_ahead: float = 0.0
+    level_size: float = 0.0
+    """Visible size at our price in the last book, to tell cancels from trades."""
+    traded_here: float = 0.0
+    """Size traded at our price since the last book."""
+
+    def is_live(self, time_ms: float) -> bool:
+        return self.live_from_ms <= time_ms < self.dead_from_ms and self.size > EPSILON
 
 
 @dataclass(frozen=True)
@@ -173,6 +196,10 @@ class MarketMaker:
     markouts: list[Markout] = field(default_factory=list)
     orders: dict[Key, Order] = field(default_factory=dict)
     pending: dict[Key, Order] = field(default_factory=dict)
+    retiring: list[Order] = field(default_factory=list)
+    """Replaced orders that are still fillable until their cancel takes effect."""
+    tx_sent: int = 0
+    tx_skipped: int = 0
     pulled_ms: dict[Side, int] = field(default_factory=lambda: {"buy": 0, "sell": 0})
     """Time each side spent pulled by a trend or a sweep."""
     swept: dict[Side, bool] = field(default_factory=lambda: {"buy": False, "sell": False})
@@ -182,6 +209,8 @@ class MarketMaker:
 
     def __post_init__(self) -> None:
         self._quoted_fair: float | None = None
+        self._tx_tokens = self.config.tx_per_minute
+        self._tx_refilled_ms: int | None = None
         self._dirty = False
         self._jump_until_ms: int | None = None
         self._vol = _TimeEwma(self.config.vol_half_life_s)
@@ -231,7 +260,7 @@ class MarketMaker:
         self.now_ms = max(self.now_ms, book.time_ms)
         self.book = book
         self._activate_pending()
-        for order in list(self.orders.values()):
+        for order in self._resting():
             self._match_book(order, book)
         if not book.bids or not book.asks:
             return
@@ -272,47 +301,75 @@ class MarketMaker:
             self._start_jump()
             self._maybe_requote(urgent=True)
 
+    def _resting(self, side: Side | None = None, time_ms: float | None = None) -> list[Order]:
+        """Orders fillable at time_ms (default now), best price first when a side is given."""
+        at = self.now_ms if time_ms is None else time_ms
+        orders = [o for o in (*self.orders.values(), *self.retiring) if o.is_live(at) and side in (None, o.side)]
+        return sorted(orders, key=lambda o: o.price, reverse=side == "buy")
+
     def _fill_from_trade(self, trade: Trade) -> None:
         resting: Side = "buy" if trade.side == "sell" else "sell"
-        for order in sorted(
-            (o for o in self.orders.values() if o.side == resting), key=lambda o: o.layer
-        ):
-            if trade.time_ms < order.live_from_ms:
-                continue
+        remaining = trade.size
+        for order in self._resting(resting, trade.time_ms):
+            if remaining <= EPSILON:
+                break
             if _better(resting, order.price, trade.price):
-                self._fill(order, order.size)
+                filled = min(order.size, remaining)
             elif trade.price == order.price:
+                order.traded_here += trade.size
                 order.queue_ahead -= trade.size
-                if order.queue_ahead < 0:
-                    self._fill(order, min(order.size, -order.queue_ahead))
-                    order.queue_ahead = 0.0
+                if order.queue_ahead >= 0:
+                    continue
+                filled = min(order.size, -order.queue_ahead, remaining)
+                order.queue_ahead = 0.0
+            else:
+                continue
+            self._fill(order, filled)
+            remaining -= filled
 
     def _activate_pending(self) -> None:
         if self.book is None:
             return
+        self.retiring = [o for o in self.retiring if o.is_live(self.now_ms)]
         for key, order in list(self.pending.items()):
             if order.live_from_ms > self.now_ms:
                 continue
             del self.pending[key]
+            current = self.orders.pop(key, None)
+            if current is not None and current.is_live(self.now_ms):
+                self.retiring.append(current)
             if order.size <= EPSILON:
-                self.orders.pop(key, None)
                 continue
             levels = self.book.bids if order.side == "buy" else self.book.asks
-            order.queue_ahead = dict(levels).get(order.price, 0.0)
+            order.queue_ahead = order.level_size = dict(levels).get(order.price, 0.0)
             self.orders[key] = order
+        for key, order in list(self.orders.items()):
+            if order.dead_from_ms <= self.now_ms:
+                del self.orders[key]
 
     def _match_book(self, order: Order, book: Book) -> None:
         own = book.bids if order.side == "buy" else book.asks
         opposite = book.asks if order.side == "buy" else book.bids
-        if opposite and not _better(order.side, opposite[0][0], order.price):
-            self._fill(order, order.size)
-            return
+        crossing = sum(size for price, size in opposite if not _better(order.side, price, order.price))
+        if crossing > EPSILON:
+            self._fill(order, min(order.size, crossing))
+            if order.size <= EPSILON:
+                return
         visible = dict(own)
         if order.price in visible:
-            order.queue_ahead = min(order.queue_ahead, visible[order.price])
+            new_size = visible[order.price]
+            left_without_trading = order.level_size - order.traded_here - new_size
+            if self.config.queue_power > 0 and left_without_trading > 0:
+                order.queue_ahead = _queue_after_cancels(
+                    order.queue_ahead, order.level_size - order.traded_here, left_without_trading,
+                    self.config.queue_power,
+                )
+            order.queue_ahead = min(order.queue_ahead, new_size)
+            order.level_size = new_size
         elif own and not _better(order.side, own[-1][0], order.price):
             # Inside the visible range but the level is gone: nobody is ahead of us.
-            order.queue_ahead = 0.0
+            order.queue_ahead = order.level_size = 0.0
+        order.traded_here = 0.0
 
     def _fill(self, order: Order, size: float) -> None:
         if size <= EPSILON:
@@ -333,9 +390,12 @@ class MarketMaker:
         self._last_fill_ms[order.side] = self.now_ms
         self._dirty = True
         order.size -= size
-        key = (order.side, order.layer)
-        if order.size <= EPSILON and self.orders.get(key) is order:
-            del self.orders[key]
+        if order.size <= EPSILON:
+            key = (order.side, order.layer)
+            if self.orders.get(key) is order:
+                del self.orders[key]
+            elif order in self.retiring:
+                self.retiring.remove(order)
 
     def _update_mid(self, book: Book) -> None:
         self.mid = (book.bids[0][0] + book.asks[0][0]) / 2
@@ -425,7 +485,8 @@ class MarketMaker:
             skew_bps(self.position, self.bias, c), spreads["buy"], spreads["sell"], c,
         )
         capacity = {"buy": c.max_position - self.position, "sell": c.max_position + self.position}
-        live_from = self.now_ms + c.latency_ms
+        live_from = self.now_ms + c.order_latency_ms
+        cancel_at = self.now_ms + c.cancel_latency_ms
         for side, prices in (("buy", bids), ("sell", asks)):
             if self.is_pulled(side):
                 wanted = {}
@@ -437,15 +498,41 @@ class MarketMaker:
                 inner_size = 1 - c.pickoff_size_cut * self.pickoff_score(side)
                 size_mult = c.jump_size_mult if jump else 1.0
                 wanted = _ladder(prices, c, capacity[side], inner_size, size_mult)
-            for key in {k for k in (*self.orders, *self.pending) if k[0] == side}:
+            for key in sorted({k for k in (*self.orders, *self.pending) if k[0] == side}):
                 current = self.pending.get(key) or self.orders.get(key)
-                if key[1] not in wanted and current.size > EPSILON:
-                    self.pending[key] = Order(side, key[1], current.price, 0.0, live_from)
+                if key[1] not in wanted and current.size > EPSILON and self._spend_tx():
+                    self._retire(key, cancel_at)
+                    self.pending[key] = Order(side, key[1], current.price, 0.0, cancel_at)
             for layer, (price, size) in wanted.items():
                 key = (side, layer)
                 current = self.pending.get(key) or self.orders.get(key)
                 if current is None or current.size <= EPSILON or current.price != price:
+                    if not self._spend_tx():
+                        continue
+                    self._retire(key, cancel_at)
                     self.pending[key] = Order(side, layer, price, size, live_from)
+
+    def _retire(self, key: Key, at_ms: int) -> None:
+        """Schedule the order resting in this slot to stop being fillable at at_ms."""
+        order = self.orders.get(key)
+        if order is not None:
+            order.dead_from_ms = min(order.dead_from_ms, at_ms)
+
+    def _spend_tx(self) -> bool:
+        """Take one transaction from a token bucket refilled at tx_per_minute; False if it's empty."""
+        c = self.config
+        if not math.isinf(c.tx_per_minute):
+            if self._tx_refilled_ms is not None:
+                refill = (self.now_ms - self._tx_refilled_ms) * c.tx_per_minute / 60_000
+                self._tx_tokens = min(c.tx_per_minute, self._tx_tokens + refill)
+            self._tx_refilled_ms = self.now_ms
+            if self._tx_tokens < 1:
+                self.tx_skipped += 1
+                self._dirty = True
+                return False
+            self._tx_tokens -= 1
+        self.tx_sent += 1
+        return True
 
 
 def fair_price(book: Book, config: Config) -> float:
@@ -512,7 +599,7 @@ def quotes(
 
     Never crosses the book or our own quotes, and no two layers on a side share a price.
     """
-    tick = tick_size(mid)
+    tick = config.tick_size or tick_size(mid)
     reservation = mid * (1 + skew_bps / 10_000)
     bid_ticks: list[int] = []
     ask_ticks: list[int] = []
@@ -564,6 +651,19 @@ def _ladder(
         capacity -= size
         wanted[layer] = (price, size)
     return wanted
+
+
+def _queue_after_cancels(front: float, level: float, cancelled: float, power: float) -> float:
+    """Queue ahead after `cancelled` size left a level of `level` without trading.
+
+    The share of it that came from behind us is back**n / (back**n + front**n).
+    """
+    back = max(0.0, level - front)
+    if front + back <= 0:
+        return 0.0
+    behind = back**power / (back**power + front**power)
+    estimate = front - (1 - behind) * cancelled + min(back - behind * cancelled, 0.0)
+    return max(0.0, estimate)
 
 
 def _price(ticks: int, tick: float) -> float:

@@ -25,7 +25,8 @@ CONFIG = Config(
     vol_multiplier=0,
     inventory_skew_bps=0,
     pressure_skew_bps=0,
-    latency_ms=100,
+    order_latency_ms=100,
+    cancel_latency_ms=100,
     requote_interval_ms=0,
     fill_cooldown_ms=0,
     markout_horizons_ms=(1000,),
@@ -121,7 +122,7 @@ def test_orders_go_live_only_after_latency():
 
 def test_trade_through_fills_whole_order():
     mm = live_mm()
-    mm.on_trade(Trade(150, "sell", 99.50, 0.01))
+    mm.on_trade(Trade(150, "sell", 99.50, 5.0))
     assert mm.position == 1.0
     assert mm.cash == pytest.approx(-99.90)
     assert BUY not in mm.orders
@@ -157,14 +158,14 @@ def test_book_crossing_our_price_fills():
 
 def test_aggressive_buy_fills_our_ask():
     mm = live_mm()
-    mm.on_trade(Trade(150, "buy", 100.20, 0.01))
+    mm.on_trade(Trade(150, "buy", 100.20, 5.0))
     assert mm.position == -1.0
     assert mm.cash == pytest.approx(100.10)
 
 
 def test_maker_fee_is_charged():
     mm = live_mm(replace(CONFIG, maker_fee_bps=10))
-    mm.on_trade(Trade(150, "sell", 99.50, 0.01))
+    mm.on_trade(Trade(150, "sell", 99.50, 5.0))
     assert mm.fees == pytest.approx(99.90 * 0.001)
     assert mm.cash == pytest.approx(-99.90 - 99.90 * 0.001)
 
@@ -181,7 +182,7 @@ def test_stops_buying_at_max_position():
 
 def test_markout_measures_mid_move_after_fill():
     mm = live_mm()
-    mm.on_trade(Trade(150, "sell", 99.50, 0.01))
+    mm.on_trade(Trade(150, "sell", 99.50, 5.0))
     mm.on_book(book(1150, bids=((99.94, 1.0),), asks=((99.96, 1.0),)))
     [markout] = mm.markouts
     assert markout.horizon_ms == 1000
@@ -190,7 +191,7 @@ def test_markout_measures_mid_move_after_fill():
 
 def test_pnl_marks_position_at_mid():
     mm = live_mm()
-    mm.on_trade(Trade(150, "sell", 99.50, 0.01))
+    mm.on_trade(Trade(150, "sell", 99.50, 5.0))
     assert mm.pnl == pytest.approx(100.0 - 99.90)
 
 
@@ -216,10 +217,23 @@ def test_layers_stop_at_max_position():
 
 def test_sweep_fills_every_layer_it_passes():
     mm = live_mm(LAYERED)
-    mm.on_trade(Trade(150, "sell", 99.60, 0.01))
+    mm.on_trade(Trade(150, "sell", 99.60, 3.01))
     # Layers 0 and 1 were traded through; layer 2 is at the trade price with an empty queue.
-    assert [(f.layer, f.size) for f in mm.fills] == [(0, 1.0), (1, 2.0), (2, 0.01)]
+    assert [(f.layer, f.size) for f in mm.fills] == [(0, 1.0), (1, 2.0), (2, pytest.approx(0.01))]
     assert mm.orders[("buy", 2)].size == pytest.approx(3.99)
+
+
+def test_trade_through_fills_no_more_than_the_trade_size():
+    mm = live_mm(LAYERED)
+    mm.on_trade(Trade(150, "sell", 99.60, 1.5))
+    assert [(f.layer, f.size) for f in mm.fills] == [(0, 1.0), (1, 0.5)]
+
+
+def test_book_crossing_fills_no_more_than_the_crossing_size():
+    mm = live_mm()
+    mm.on_book(book(150, bids=((99.80, 1.0),), asks=((99.85, 0.3),)))
+    assert mm.position == pytest.approx(0.3)
+    assert mm.orders[BUY].size == pytest.approx(0.7)
 
 
 def test_fewer_layers_cancels_the_outer_ones():
@@ -238,7 +252,7 @@ PICKOFF = replace(
 def picked_off_bid(config=PICKOFF):
     """Our bid at 99.90 fills, then the mid drops to 99.50 a second later (-40 bps markout)."""
     mm = live_mm(config)
-    mm.on_trade(Trade(150, "sell", 99.50, 0.01))
+    mm.on_trade(Trade(150, "sell", 99.50, 5.0))
     mm.on_book(book(1150, bids=((99.49, 1.0),), asks=((99.51, 1.0),)))
     return mm
 
@@ -268,7 +282,7 @@ def test_pickoff_score_decays_without_new_fills():
 
 def test_favourable_markouts_do_not_widen():
     mm = live_mm(PICKOFF)
-    mm.on_trade(Trade(150, "sell", 99.50, 0.01))
+    mm.on_trade(Trade(150, "sell", 99.50, 5.0))
     mm.on_book(book(1150, bids=((100.49, 1.0),), asks=((100.51, 1.0),)))
     assert mm.pickoff_bps("buy") < 0
     assert mm.pickoff_score("buy") == 0.0
@@ -350,7 +364,7 @@ def test_requote_interval_still_applies():
 
 def test_fill_requotes_without_a_move():
     mm = live_mm(CADENCE)
-    mm.on_trade(Trade(150, "sell", 99.50, 0.01))
+    mm.on_trade(Trade(150, "sell", 99.50, 5.0))
     mm.on_book(book(200))
     assert mm.pending[BUY].price == 99.90
 
@@ -373,7 +387,7 @@ def test_book_jump_widens_and_shrinks_quotes_for_a_while():
 
 def test_sweep_pulls_the_swept_side_until_the_next_book():
     mm = live_mm(replace(LAYERED, jump_bps=5, jump_spread_mult=2.0, jump_size_mult=0.5))
-    mm.on_trade(Trade(150, "sell", 99.70, 0.01))  # 30 bps through the mid
+    mm.on_trade(Trade(150, "sell", 99.70, 10.0))  # 30 bps through the mid
     assert [f.layer for f in mm.fills] == [0, 1]
     assert mm.swept["buy"]
     assert mm.pending[("buy", 2)].size == 0
@@ -465,3 +479,72 @@ def test_volatility_burst_turns_chaotic_and_drops_layers():
     mm.on_book(book(t + 200, **burst[1]))
     assert {k for k in mm.orders if k[0] == "buy"} == {("buy", 0), ("buy", 1)}
     assert mm.regime_ms["chaotic"] > 0
+
+
+SLOW_CANCEL = replace(CONFIG, requote_move_bps=0, order_latency_ms=100, cancel_latency_ms=300)
+UP_10 = dict(bids=((100.09, 1.0),), asks=((100.11, 1.0),))
+
+
+def test_replaced_order_stays_fillable_until_its_cancel_lands():
+    mm = live_mm(SLOW_CANCEL)
+    mm.on_book(book(200, **UP_10))  # Requote at 200: new bid live at 300, old one dies at 500.
+    mm.on_book(book(350, **UP_10))
+    assert mm.orders[BUY].price == 99.99
+    assert [o.price for o in mm.retiring if o.side == "buy"] == [99.90]
+    mm.on_trade(Trade(400, "sell", 99.00, 10.0))
+    assert sorted(f.price for f in mm.fills) == [99.90, 99.99]
+
+
+def test_retired_order_stops_filling_once_cancelled():
+    mm = live_mm(SLOW_CANCEL)
+    mm.on_book(book(200, **UP_10))
+    mm.on_book(book(550, **UP_10))
+    mm.on_trade(Trade(560, "sell", 99.00, 10.0))
+    assert [f.price for f in mm.fills] == [99.99]
+
+
+def test_cancel_takes_cancel_latency():
+    mm = live_mm(replace(CONFIG, cancel_latency_ms=300))
+    mm.position = CONFIG.max_position
+    mm.on_book(book(200))  # Cancel the bid at 200; it lands at 500.
+    mm.on_trade(Trade(450, "sell", 99.00, 1.0))
+    assert len(mm.fills) == 1
+    mm.on_book(book(500))
+    assert BUY not in mm.orders
+
+
+def test_tx_budget_skips_actions_once_spent():
+    mm = MarketMaker(replace(LAYERED, tx_per_minute=4))
+    mm.on_book(book(0))  # Six orders wanted, four allowed.
+    assert len(mm.pending) == 4
+    assert mm.tx_sent == 4 and mm.tx_skipped == 2
+    mm.on_book(book(30_000))  # Half a minute refills two.
+    assert mm.tx_sent == 6
+
+
+def test_risk_averse_queue_ignores_cancels_ahead_unless_the_level_shrinks_past_us():
+    mm = live_mm(bids=((99.99, 1.0), (99.90, 4.0)))
+    mm.on_book(book(150, bids=((99.99, 1.0), (99.90, 3.0), (99.80, 1.0))))
+    assert mm.orders[BUY].queue_ahead == 3.0
+
+
+def test_power_queue_moves_us_up_in_proportion_to_whos_cancelling():
+    mm = live_mm(replace(CONFIG, queue_power=1.0), bids=((99.99, 1.0), (99.90, 4.0)))
+    order = mm.orders[BUY]
+    order.queue_ahead = 1.0  # 1 ahead, 3 behind.
+    mm.on_book(book(150, bids=((99.99, 1.0), (99.90, 2.0), (99.80, 1.0))))
+    # 2 cancelled, 1/4 of it ahead of us.
+    assert order.queue_ahead == pytest.approx(0.5)
+
+
+def test_power_queue_does_not_count_traded_size_as_cancels():
+    mm = live_mm(replace(CONFIG, queue_power=1.0), bids=((99.99, 1.0), (99.90, 4.0)))
+    mm.on_trade(Trade(120, "sell", 99.90, 2.0))
+    assert mm.orders[BUY].queue_ahead == 2.0
+    mm.on_book(book(150, bids=((99.99, 1.0), (99.90, 2.0), (99.80, 1.0))))
+    assert mm.orders[BUY].queue_ahead == 2.0
+
+
+def test_tick_size_override():
+    assert quotes(100.0, 99.95, 100.05, 0, 10, 10, replace(CONFIG, tick_size=0.05)) == ([99.90], [100.10])
+    assert quotes(100.0, 99.95, 100.05, 0, 7, 7, replace(CONFIG, tick_size=0.05)) == ([99.90], [100.10])
