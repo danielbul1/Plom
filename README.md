@@ -72,6 +72,15 @@ uv run plom compare data/btc.jsonl.gz --profile lighter-standard --grid base-hal
 
 `--grid FLAG=V1,V2` takes any config flag; repeated grids are crossed. An interval that straddles zero means the data can't tell yet.
 
+## Rechecking every stage
+
+`scripts/recheck.py` replays a recording under the defaults and each B4-B7 idea (reference weight, forecast use, GLFT, position age and flattening, bipower volatility and Lee-Mykland jumps) for several venue profiles in parallel, and writes one Markdown report: the differences the data can see, lead-lag, a table per stage and venue, and the defaults' full evaluation. A recording still being written can be used.
+
+```bash
+uv run python scripts/recheck.py data/btc.jsonl.gz
+uv run python scripts/recheck.py data/btc.jsonl.gz --profiles hyperliquid,lighter-standard --out recheck.md
+```
+
 ## Lead-lag
 
 `plom leadlag` measures, from a multi-venue recording, how far each venue's mid lags the reference (peak cross-correlation of mid returns on a 25ms grid of receive times), and how much of the basis-adjusted gap each venue closes over the next 250ms to 5s.

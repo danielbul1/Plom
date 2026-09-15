@@ -134,7 +134,7 @@ async def _mm(args: argparse.Namespace) -> None:
                 print(_status(args.coin, mm), flush=True)
     finally:
         print(evaluate.format_report(evaluate.evaluate(mm, tracker)), flush=True)
-        print(_breakdown(mm), flush=True)
+        print(breakdown(mm), flush=True)
 
 
 async def _compare(args: argparse.Namespace) -> None:
@@ -216,7 +216,7 @@ def _side_quotes(mm: MarketMaker, side: str) -> str:
     return f"{side} {orders[0].price:,.6g} x{len(orders)}" if orders else f"{side} -"
 
 
-def _breakdown(mm: MarketMaker) -> str:
+def breakdown(mm: MarketMaker) -> str:
     """Fills, edge and short markouts per layer and per regime."""
     horizons = [h for h in mm.config.markout_horizons_ms if h <= 5000]
     header = "fills     volume    edge  " + "  ".join(f"{f'mo{h / 1000:g}s':>6}" for h in horizons)
