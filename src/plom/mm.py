@@ -18,6 +18,7 @@ from plom.alpha import AlphaConfig, OnlineAlpha
 from plom.glft import FillIntensity, Glft, glft
 from plom.market import Book, Trade
 from plom.pressure import pressure
+from plom.volatility import GridVolatility, TimeEwma
 
 Side = Literal["buy", "sell"]
 SIDES: tuple[Side, Side] = ("buy", "sell")
@@ -42,6 +43,12 @@ class Config:
     vol_multiplier: float = 1.0
     """Half spread widens to vol_multiplier x one-second volatility when that is larger."""
     vol_half_life_s: float = 30.0
+    vol_bipower: int = 0
+    """1 measures volatility, and the regime ratio, with bipower variation on a vol_sample_ms grid, which
+    ignores jumps; 0 uses the realized variance of book-to-book moves."""
+    vol_sample_ms: int = 10_000
+    """Grid for bipower variation and the Lee-Mykland test. Shorter grids on BTC mostly see tick
+    discreteness (see plom.volatility)."""
     inventory_skew_bps: float = 2.0
     """How far quotes shift against the position when it is at max_position."""
     glft_gamma: float = 0.0
@@ -151,6 +158,14 @@ class Config:
     """...or after this long, or after a fill or bias change."""
     jump_bps: float = 3.0
     """A book-to-book mid step, or a trade this far through the mid, counts as a jump."""
+    jump_alpha: float = 0.0
+    """Above 0, the move since the last vol_sample_ms sample also counts as a jump when the Lee-Mykland test
+    rejects no jump at this significance, about jump_alpha false jumps a day (see plom.volatility); 0
+    turns the test off."""
+    jump_window_samples: float = 30.0
+    """How many samples the Lee-Mykland local volatility remembers."""
+    jump_vol_floor_bps: float = 0.05
+    """Smallest local volatility per sample the Lee-Mykland test divides by."""
     jump_hold_ms: int = 3000
     jump_spread_mult: float = 2.0
     """How much wider all quotes sit for jump_hold_ms after a jump."""
@@ -199,24 +214,6 @@ class Markout:
     horizon_ms: int
     bps: float
     """How far the mid moved in the fill's favour after horizon_ms."""
-
-
-@dataclass
-class _TimeEwma:
-    """Exponentially weighted mean over time, corrected for starting from nothing."""
-
-    half_life_s: float
-    _sum: float = 0.0
-    _weight: float = 0.0
-
-    def add(self, value: float, dt_s: float) -> None:
-        alpha = 1 - 0.5 ** (dt_s / self.half_life_s)
-        self._sum = (1 - alpha) * self._sum + alpha * value
-        self._weight = (1 - alpha) * self._weight + alpha
-
-    @property
-    def mean(self) -> float:
-        return self._sum / self._weight if self._weight > 0 else 0.0
 
 
 @dataclass
@@ -272,16 +269,20 @@ class MarketMaker:
         self._tx_refilled_ms: int | None = None
         self._dirty = False
         self._jump_until_ms: int | None = None
-        self._vol = _TimeEwma(self.config.vol_half_life_s)
-        self._vol_baseline = _TimeEwma(self.config.vol_baseline_half_life_s)
+        self._vol = TimeEwma(self.config.vol_half_life_s)
+        self._vol_baseline = TimeEwma(self.config.vol_baseline_half_life_s)
         self._vol_ref: tuple[int, float] | None = None
+        c = self.config
+        self.volatility = GridVolatility(
+            c.vol_sample_ms, c.vol_half_life_s, c.vol_baseline_half_life_s, c.jump_alpha, c.jump_window_samples,
+            c.jump_vol_floor_bps,
+        )
         self._mids: deque[tuple[int, float]] = deque()
         self._last_book_ms: int | None = None
         self._last_requote_ms: int | None = None
         self._last_fill_ms: dict[Side, int | None] = {"buy": None, "sell": None}
         self._pickoff: dict[Side, tuple[float, int]] = {"buy": (0.0, 0), "sell": (0.0, 0)}
-        self._basis = _TimeEwma(self.config.basis_half_life_s)
-        c = self.config
+        self._basis = TimeEwma(self.config.basis_half_life_s)
         self.alpha = OnlineAlpha(AlphaConfig(
             c.alpha_horizon_ms, c.alpha_sample_ms, c.alpha_half_life_samples, c.alpha_ridge,
             c.alpha_warmup_samples, c.flow_half_life_ms,
@@ -306,13 +307,16 @@ class MarketMaker:
     @property
     def vol_bps(self) -> float:
         """Recent one-second volatility of the mid, in bps."""
-        return math.sqrt(self._vol.mean)
+        return self.volatility.bipower_bps if self.config.vol_bipower else math.sqrt(self._vol.mean)
 
     @property
     def vol_ratio(self) -> float:
         """Recent volatility relative to its slow baseline; 1 before there is a baseline."""
-        baseline = self._vol_baseline.mean
-        return math.sqrt(self._vol.mean / baseline) if baseline > 0 else 1.0
+        if self.config.vol_bipower:
+            recent, baseline = self.volatility.bipower.mean, self.volatility.bipower_baseline.mean
+        else:
+            recent, baseline = self._vol.mean, self._vol_baseline.mean
+        return math.sqrt(recent / baseline) if baseline > 0 else 1.0
 
     @property
     def glft(self) -> Glft | None:
@@ -382,6 +386,8 @@ class MarketMaker:
         self.intensity.on_book(self.now_ms, self.fair)
         self.regime = classify_regime(self.vol_ratio, self.config)
         jumped = previous_mid is not None and abs(self.mid / previous_mid - 1) * 10_000 >= self.config.jump_bps
+        if self.volatility.on_mid(self.now_ms, self.mid):
+            jumped = True
         if jumped:
             self._start_jump()
         self._update_trend()
