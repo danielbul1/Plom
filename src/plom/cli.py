@@ -203,7 +203,7 @@ def _status(coin: str, mm: MarketMaker) -> str:
     )
     return (
         f"{_clock(mm.now_ms)}  {coin}  mid {mm.mid:,.6g}  [{quotes}]  "
-        f"pos {mm.position:+.5f}  pnl {mm.pnl:+.2f}  fills {len(mm.fills)}  "
+        f"pos {mm.position:+.5f} {mm.position_age_s:.0f}s  pnl {mm.pnl:+.2f}  fills {len(mm.fills)}  "
         f"edge {_mean([edge_bps(f, f.mid) for f in mm.fills]):+.2f}bps  {markouts}  "
         f"vol {mm.vol_bps:.2f}bps x{mm.vol_ratio:.1f} {mm.regime}  bias {mm.bias:+d}  trend {mm.trend:+d}  "
         f"pickoff b{mm.pickoff_score('buy'):.2f}/s{mm.pickoff_score('sell'):.2f}"
@@ -230,6 +230,9 @@ def _breakdown(mm: MarketMaker) -> str:
         f" over {mm.alpha.scored:,} forecasts; weights "
         + "  ".join(f"{name} {w:+.3f}" for name, w in zip(FEATURES, mm.alpha.weights))
         + f"; pulls buy {mm.alpha_pulls['buy']} sell {mm.alpha_pulls['sell']}",
+        _glft_line(mm),
+        f"flattens       {len(mm.flattens)} fills, ${sum(f.price * f.size for f in mm.flattens):,.2f}, cost "
+        f"${sum(-edge_bps(f, f.mid) * f.price * f.size / 10_000 + f.fee for f in mm.flattens):,.4f} (crossing + fees)",
         "",
         f"layer    {header}",
     ]
@@ -253,6 +256,17 @@ def _breakdown(mm: MarketMaker) -> str:
             + "  ".join(f"{m:>+6.2f}" for m in markouts)
         )
     return "\n".join(lines)
+
+
+def _glft_line(mm: MarketMaker) -> str:
+    intensity = mm.intensity
+    if intensity.k is None:
+        return "glft           fill intensity not calibrated yet"
+    line = f"glft           A {intensity.a:.3f}/s  k {intensity.k:.3f}/bp"
+    model = mm.glft
+    if model:
+        line += f"  -> half spread {model.half_spread_bps:.2f}bps, skew {model.skew_bps:.3f}bps/lot"
+    return line
 
 
 def _mean(values: list[float]) -> float:

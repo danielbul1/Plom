@@ -15,6 +15,7 @@ from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from plom.alpha import AlphaConfig, OnlineAlpha
+from plom.glft import FillIntensity, Glft, glft
 from plom.market import Book, Trade
 from plom.pressure import pressure
 
@@ -43,6 +44,23 @@ class Config:
     vol_half_life_s: float = 30.0
     inventory_skew_bps: float = 2.0
     """How far quotes shift against the position when it is at max_position."""
+    glft_gamma: float = 0.0
+    """GLFT risk aversion, per bp per lot of order_size. Above 0, once fill intensity is calibrated, the
+    half spread and inventory skew come from GLFT (see plom.glft) instead of vol_multiplier and
+    inventory_skew_bps; base_half_spread_bps stays a floor. 0 calibrates and reports without using it."""
+    glft_layer_spacing: float = 1.0
+    """With GLFT, each layer sits this many GLFT half spreads beyond the one inside it."""
+    glft_sample_ms: int = 100
+    glft_half_life_s: float = 600.0
+    glft_step_bps: float = 0.25
+    glft_buckets: int = 40
+    glft_min_hits: float = 10.0
+    position_age_s: float = math.inf
+    """The inventory skew grows by its own size for every position_age_s the position has been open."""
+    flatten_age_s: float = math.inf
+    """Once the position has been open this long, cross the spread to cut it by flatten_fraction."""
+    flatten_fraction: float = 1.0
+    flatten_cooldown_ms: int = 5000
     pressure_skew_bps: float = 1.0
     """How far quotes shift towards the book-pressure bias."""
     pressure_enter: float = 0.3
@@ -231,6 +249,9 @@ class MarketMaker:
     inventory_pnl: float = 0.0
     """PnL from holding the position through mid moves. pnl = spread_capture + inventory_pnl - fees."""
     fills: list[Fill] = field(default_factory=list)
+    """Maker fills."""
+    flattens: list[Fill] = field(default_factory=list)
+    """Taker fills from crossing the spread to flatten an old position, with layer -1."""
     markouts: list[Markout] = field(default_factory=list)
     orders: dict[Key, Order] = field(default_factory=dict)
     pending: dict[Key, Order] = field(default_factory=dict)
@@ -266,6 +287,13 @@ class MarketMaker:
             c.alpha_warmup_samples, c.flow_half_life_ms,
         ))
         self._quoted_prediction = 0.0
+        self.intensity = FillIntensity(
+            c.glft_sample_ms, c.glft_half_life_s, c.glft_step_bps, c.glft_buckets, c.glft_min_hits
+        )
+        self._position_since_ms: int | None = None
+        self._flatten: tuple[Side, float, int] | None = None
+        """A pending taker order: side, size, and when it lands."""
+        self._last_flatten_ms: int | None = None
         self._basis_ms: int | None = None
         self._reference_mids: deque[tuple[int, float]] = deque()
         horizons = {*self.config.markout_horizons_ms, self.config.pickoff_horizon_ms}
@@ -285,6 +313,19 @@ class MarketMaker:
         """Recent volatility relative to its slow baseline; 1 before there is a baseline."""
         baseline = self._vol_baseline.mean
         return math.sqrt(self._vol.mean / baseline) if baseline > 0 else 1.0
+
+    @property
+    def glft(self) -> Glft | None:
+        """GLFT half spread and skew at current volatility; None while off or not yet calibrated."""
+        if self.config.glft_gamma <= 0 or self.intensity.k is None:
+            return None
+        c = self.config
+        return glft(self.vol_bps, self.intensity.a, self.intensity.k, c.glft_gamma, c.maker_fee_bps)
+
+    @property
+    def position_age_s(self) -> float:
+        """How long the position has been open: since it was last flat or changed sign."""
+        return 0.0 if self._position_since_ms is None else (self.now_ms - self._position_since_ms) / 1000
 
     def pickoff_bps(self, side: Side) -> float:
         """Recent average adverse markout of this side's fills, decayed while it doesn't fill."""
@@ -318,6 +359,7 @@ class MarketMaker:
         self._activate_pending()
         for order in self._resting():
             self._match_book(order, book)
+        self._execute_flatten(book)
         if not book.bids or not book.asks:
             return
         if self._last_book_ms is not None:
@@ -337,6 +379,7 @@ class MarketMaker:
         if abs(self.alpha.prediction_bps - self._quoted_prediction) >= self.config.requote_move_bps:
             self._dirty = True
         self._update_fair()
+        self.intensity.on_book(self.now_ms, self.fair)
         self.regime = classify_regime(self.vol_ratio, self.config)
         jumped = previous_mid is not None and abs(self.mid / previous_mid - 1) * 10_000 >= self.config.jump_bps
         if jumped:
@@ -346,6 +389,7 @@ class MarketMaker:
         self._settle_markouts()
         if self.bias != bias or self.regime != regime:
             self._dirty = True
+        self._maybe_flatten()
         turned_chaotic = self.regime == "chaotic" and regime != "chaotic"
         self._maybe_requote(urgent=jumped or was_swept or turned_chaotic or self.trend != trend)
 
@@ -405,6 +449,7 @@ class MarketMaker:
         self.alpha.on_trade(self.now_ms, trade)
         if stale or self.mid is None:
             return
+        self.intensity.on_trade(trade)
         sign = 1 if trade.side == "buy" else -1
         if sign * (trade.price / self.mid - 1) * 10_000 >= self.config.jump_bps:
             self.swept["buy" if trade.side == "sell" else "sell"] = True
@@ -484,17 +529,7 @@ class MarketMaker:
     def _fill(self, order: Order, size: float) -> None:
         if size <= EPSILON:
             return
-        notional = order.price * size
-        fee = notional * self.config.maker_fee_bps / 10_000
-        sign = 1 if order.side == "buy" else -1
-        self.position += sign * size
-        self.cash -= sign * notional + fee
-        self.fees += fee
-        self.volume += notional
-        self.spread_capture += sign * ((self.mid or order.price) - order.price) * size
-        fill = Fill(
-            self.now_ms, order.side, order.layer, order.price, size, fee, self.mid or order.price, self.regime
-        )
+        fill = self._trade(order.side, order.layer, order.price, size, self.config.maker_fee_bps)
         self.fills.append(fill)
         for queue in self._unsettled.values():
             queue.append(fill)
@@ -507,6 +542,51 @@ class MarketMaker:
                 del self.orders[key]
             elif order in self.retiring:
                 self.retiring.remove(order)
+
+    def _trade(self, side: Side, layer: int, price: float, size: float, fee_bps: float) -> Fill:
+        """Book a fill into position, cash, fees and PnL attribution."""
+        notional = price * size
+        fee = notional * fee_bps / 10_000
+        sign = 1 if side == "buy" else -1
+        previous = self.position
+        self.position += sign * size
+        self.cash -= sign * notional + fee
+        self.fees += fee
+        self.volume += notional
+        self.spread_capture += sign * ((self.mid or price) - price) * size
+        if abs(self.position) <= EPSILON:
+            self._position_since_ms = None
+        elif self._position_since_ms is None or previous * self.position < 0:
+            self._position_since_ms = self.now_ms
+        return Fill(self.now_ms, side, layer, price, size, fee, self.mid or price, self.regime)
+
+    def _maybe_flatten(self) -> None:
+        c = self.config
+        if self._flatten is not None or self.position_age_s < c.flatten_age_s:
+            return
+        if self._last_flatten_ms is not None and self.now_ms - self._last_flatten_ms < c.flatten_cooldown_ms:
+            return
+        if not self._spend_tx():
+            return
+        side: Side = "sell" if self.position > 0 else "buy"
+        self._flatten = (side, abs(self.position) * c.flatten_fraction, self.now_ms + c.order_latency_ms)
+        self._last_flatten_ms = self.now_ms
+
+    def _execute_flatten(self, book: Book) -> None:
+        """Fill a landed flatten against the book, walking levels up to their visible size."""
+        if self._flatten is None or self._flatten[2] > self.now_ms:
+            return
+        side, size, _ = self._flatten
+        self._flatten = None
+        still_reduces = (side == "sell") == (self.position > 0)
+        size = min(size, abs(self.position)) if still_reduces else 0.0
+        for price, available in book.asks if side == "buy" else book.bids:
+            if size <= EPSILON:
+                break
+            taken = min(size, available)
+            self.flattens.append(self._trade(side, -1, price, taken, self.config.taker_fee_bps))
+            size -= taken
+        self._dirty = True
 
     def _update_mid(self, book: Book) -> None:
         mid = (book.bids[0][0] + book.asks[0][0]) / 2
@@ -593,7 +673,8 @@ class MarketMaker:
         self._dirty = False
         jump = self.is_jumping
         c = regime_config(self.config, self.regime)
-        half = half_spread_bps(self.vol_bps, c) * (c.jump_spread_mult if jump else 1.0)
+        model = self.glft
+        half = half_spread_bps(self.vol_bps, c, model) * (c.jump_spread_mult if jump else 1.0)
         spreads = {side: half * (1 + c.pickoff_spread_mult * self.pickoff_score(side)) for side in SIDES}
         against = {"buy": -self.alpha.prediction_bps, "sell": self.alpha.prediction_bps}
         for side in SIDES:
@@ -601,9 +682,11 @@ class MarketMaker:
         alpha_pulled = {
             side: against[side] > spreads[side] + c.maker_fee_bps + c.alpha_pull_margin_bps for side in SIDES
         }
+        age_mult = 1 + self.position_age_s / c.position_age_s
         bids, asks = quotes(
             self.fair, self.book.bids[0][0], self.book.asks[0][0],
-            skew_bps(self.position, self.bias, c), spreads["buy"], spreads["sell"], c,
+            skew_bps(self.position, self.bias, self.config, model, age_mult), spreads["buy"], spreads["sell"], c,
+            c.glft_layer_spacing * half if model else None,
         )
         capacity = {"buy": c.max_position - self.position, "sell": c.max_position + self.position}
         live_from = self.now_ms + c.order_latency_ms
@@ -693,20 +776,30 @@ def regime_config(config: Config, regime: Regime) -> Config:
                 order_size=config.order_size * config.chaotic_size_mult,
                 layers=min(config.layers, config.chaotic_layers),
                 layer_spacing=config.layer_spacing * config.chaotic_spacing_mult,
+                glft_layer_spacing=config.glft_layer_spacing * config.chaotic_spacing_mult,
                 size_growth=config.size_growth * config.chaotic_size_growth_mult,
             )
         case _:
             return config
 
 
-def half_spread_bps(vol_bps: float, config: Config) -> float:
+def half_spread_bps(vol_bps: float, config: Config, model: Glft | None = None) -> float:
     """Distance of the inner layer from the reservation price before any side-specific widening."""
-    return max(config.base_half_spread_bps, config.vol_multiplier * vol_bps)
+    wanted = model.half_spread_bps if model else config.vol_multiplier * vol_bps
+    return max(config.base_half_spread_bps, wanted)
 
 
-def skew_bps(position: float, bias: int, config: Config) -> float:
-    """How far the reservation price sits above the mid: against inventory, towards book pressure."""
-    return -config.inventory_skew_bps * position / config.max_position + config.pressure_skew_bps * bias
+def skew_bps(position: float, bias: int, config: Config, model: Glft | None = None, age_mult: float = 1.0) -> float:
+    """How far the reservation price sits above the mid: against inventory, towards book pressure.
+
+    With GLFT the inventory part is its per-lot skew times the position in lots of order_size.
+    age_mult scales the inventory part as the position ages.
+    """
+    if model:
+        inventory = model.skew_bps * position / config.order_size
+    else:
+        inventory = config.inventory_skew_bps * position / config.max_position
+    return -inventory * age_mult + config.pressure_skew_bps * bias
 
 
 def quotes(
@@ -717,19 +810,27 @@ def quotes(
     bid_half_spread_bps: float,
     ask_half_spread_bps: float,
     config: Config,
+    layer_step_bps: float | None = None,
 ) -> tuple[list[float], list[float]]:
     """Bid and ask prices per layer, inner first, around the mid shifted by skew_bps.
 
-    Never crosses the book or our own quotes, and no two layers on a side share a price.
+    Layers sit layer_spacing times further out than the one inside them, or, given layer_step_bps,
+    that much further out. Never crosses the book or our own quotes, and no two layers on a side
+    share a price.
     """
     tick = config.tick_size or tick_size(mid)
     reservation = mid * (1 + skew_bps / 10_000)
     bid_ticks: list[int] = []
     ask_ticks: list[int] = []
     for layer in range(config.layers):
-        spacing = config.layer_spacing**layer / 10_000
-        bid = math.floor(reservation * (1 - bid_half_spread_bps * spacing) / tick + EPSILON)
-        ask = math.ceil(reservation * (1 + ask_half_spread_bps * spacing) / tick - EPSILON)
+        if layer_step_bps is None:
+            bid_depth = bid_half_spread_bps * config.layer_spacing**layer
+            ask_depth = ask_half_spread_bps * config.layer_spacing**layer
+        else:
+            bid_depth = bid_half_spread_bps + layer * layer_step_bps
+            ask_depth = ask_half_spread_bps + layer * layer_step_bps
+        bid = math.floor(reservation * (1 - bid_depth / 10_000) / tick + EPSILON)
+        ask = math.ceil(reservation * (1 + ask_depth / 10_000) / tick - EPSILON)
         if layer == 0:
             bid = min(bid, round(best_ask / tick) - 1)
             ask = max(ask, round(best_bid / tick) + 1, bid + 1)
