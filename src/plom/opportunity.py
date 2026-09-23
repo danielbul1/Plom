@@ -57,13 +57,14 @@ class Report:
     hours: float
     threshold_bps: float
     outcomes: list[Outcome]
+    leaders: tuple[str, ...] = ()
 
 
 def measure(
     path: Path, venue: str, threshold_bps: float = 1.5, latencies_ms: Sequence[int] = (50, 150, 300),
-    window_ms: int = 500, markout_ms: int = 2000,
+    window_ms: int = 500, markout_ms: int = 2000, leaders: Sequence[str] = (),
 ) -> Report:
-    comp = composite.Composite(tuple(v for v in composite.VENUES if v != venue))
+    comp = composite.Composite(tuple(v for v in (*composite.VENUES, *leaders) if v != venue))
     parsers = {v: VENUES[v].Parser() for v in (*comp.venues, venue)}
     ref_t, ref_px = [], []
     book_t, book_recv, bid, bid_sz, ask, ask_sz = [], [], [], [], [], []
@@ -101,7 +102,7 @@ def measure(
     events = sharp_moves(ref_t, ref_px, threshold_bps)
     hours = (ref_t[-1] - ref_t[0]) / 3_600_000
     outcomes = [_outcome(events, book, trades, latency, window_ms, markout_ms) for latency in latencies_ms]
-    return Report(venue, hours, threshold_bps, outcomes)
+    return Report(venue, hours, threshold_bps, outcomes, tuple(leaders))
 
 
 def sharp_moves(times: np.ndarray, prices: np.ndarray, threshold_bps: float) -> list[tuple[float, int]]:
@@ -157,7 +158,8 @@ def _outcome(events, book, trades, latency_ms, window_ms, markout_ms) -> Outcome
 def format_report(report: Report, fees_bps: Sequence[float]) -> str:
     per_hour = sum(o.events for o in report.outcomes[:1]) / report.hours if report.hours else 0.0
     lines = [
-        f"--- {report.venue}: {report.outcomes[0].events if report.outcomes else 0} composite moves >= "
+        f"--- {report.venue}: {report.outcomes[0].events if report.outcomes else 0} composite"
+        f"{' (with ' + ', '.join(report.leaders) + ')' if report.leaders else ''} moves >= "
         f"{report.threshold_bps:g}bps in {report.hours:.1f}h ({per_hour:.1f}/h) ---",
         "latency  stale fill  stale loss   good fill  good edge   expected bps per move (stale / good) at maker fee "
         + ", ".join(f"{f:g}" for f in fees_bps),

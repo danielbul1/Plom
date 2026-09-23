@@ -80,6 +80,7 @@ def main() -> None:
     ll.add_argument("--reference", choices=[*VENUES, composite.NAME], default=composite.NAME)
     ll.add_argument("--venues", default="hyperliquid,lighter,orderly,bitunix")
     ll.add_argument("--move-bps", type=float, default=1.5, help="a reference move this big within 250ms counts as sharp")
+    ll.add_argument("--leaders", default="", help=f"add these to the composite, e.g. {','.join(composite.LEADERS)}")
 
     op = commands.add_parser("opportunity", help="what a lagging venue's quotes stand to lose or win around sharp composite moves")
     op.add_argument("replay", type=Path)
@@ -87,6 +88,7 @@ def main() -> None:
     op.add_argument("--move-bps", type=float, default=1.5)
     op.add_argument("--latencies-ms", default="50,150,300")
     op.add_argument("--fees-bps", default="0,0.4,1.5,2", help="maker fees to net the good side against")
+    op.add_argument("--leaders", default="", help=f"add these to the composite, e.g. {','.join(composite.LEADERS)}")
 
     sv = commands.add_parser("serve", help="aggregate live data from every venue and serve it over REST and WebSocket")
     sv.add_argument("--coins", default=os.environ.get("PLOM_COINS", ",".join(SERVE_COINS)))
@@ -199,7 +201,11 @@ async def _leadlag(args: argparse.Namespace) -> None:
     from plom import leadlag
 
     venues = [v for v in args.venues.split(",") if v != args.reference]
-    print(leadlag.format_report(args.reference, leadlag.measure(args.replay, args.reference, venues, args.move_bps)))
+    print(leadlag.format_report(args.reference, leadlag.measure(args.replay, args.reference, venues, args.move_bps, _list(args.leaders))))
+
+
+def _list(value: str) -> list[str]:
+    return [v for v in value.split(",") if v]
 
 
 async def _opportunity(args: argparse.Namespace) -> None:
@@ -209,7 +215,7 @@ async def _opportunity(args: argparse.Namespace) -> None:
     fees = [float(x) for x in args.fees_bps.split(",")]
     for venue in args.venues.split(","):
         try:
-            report = opportunity.measure(args.replay, venue, args.move_bps, latencies)
+            report = opportunity.measure(args.replay, venue, args.move_bps, latencies, leaders=_list(args.leaders))
         except ValueError as error:
             print(f"--- {venue}: {error}")
             continue

@@ -260,3 +260,61 @@ def test_bitunix_books_and_trades_use_the_message_time():
     assert bitunix.Parser().events(book) == [Book(9, [(100.0, 1.0), (99.0, 2.0)], [(101.0, 3.0)])]
     trade = {"ch": "trade", "ts": 11, "data": [{"t": "2026-09-23T11:01:43Z", "p": "100.5", "v": "0.2", "s": "sell"}]}
     assert bitunix.Parser().events(trade) == [Trade(11, "sell", 100.5, 0.2)]
+
+
+def test_a_failing_venue_does_not_stop_the_recording(tmp_path, monkeypatch):
+    import asyncio
+    import types
+
+    async def refuses(coin):
+        raise ConnectionError("restricted jurisdiction")
+        yield  # pragma: no cover
+
+    async def works(coin):
+        for i in range(3):
+            yield {"n": i}
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(recording, "VENUES", {
+        "bad": types.SimpleNamespace(messages=refuses), "good": types.SimpleNamespace(messages=works),
+    })
+    monkeypatch.setattr(recording, "FLUSH_EVERY_S", 0.01)
+    path = tmp_path / "r.jsonl"
+
+    async def run():
+        task = asyncio.create_task(recording.record("BTC", ["bad", "good"], path))
+        await asyncio.sleep(0.2)
+        assert not task.done()  # The failing venue didn't take the recording down.
+        task.cancel()
+
+    asyncio.run(run())
+    assert [msg for _, _, msg in recording.read(path)] == [{"n": 0}, {"n": 1}, {"n": 2}]
+
+
+# Bybit -----------------------------------------------------------------------------------------
+
+def bybit_book(kind, u, bids=(), asks=(), depth=50):
+    rows = lambda levels: [[str(p), str(s)] for p, s in levels]
+    return {"topic": f"orderbook.{depth}.BTCUSDT", "type": kind, "ts": 9, "cts": 8, "data": {"b": rows(bids), "a": rows(asks), "u": u}}
+
+
+def test_bybit_top_of_book_and_trades():
+    from plom import bybit
+
+    [book] = bybit.Parser().events(bybit_book("snapshot", 5, [(100, 1)], [(101, 2)], depth=1))
+    assert book == Book(8, [(100.0, 1.0)], [(101.0, 2.0)])
+    trade = {"topic": "publicTrade.BTCUSDT", "type": "snapshot", "ts": 9, "data": [{"T": 7, "S": "Sell", "v": "0.03", "p": "100.5"}]}
+    assert bybit.Parser().events(trade) == [Trade(7, "sell", 100.5, 0.03)]
+
+
+def test_bybit_depth_deltas_follow_update_ids_and_resync_on_a_gap():
+    from plom import bybit
+
+    parser = bybit.Parser()
+    parser.events(bybit_book("snapshot", 10, [(100, 1), (99, 1)], [(101, 1)]))
+    [book] = parser.events(bybit_book("delta", 11, [(100, 0)], [(101, 3)]))
+    assert book.bids == [(99.0, 1.0)] and book.asks == [(101.0, 3.0)]
+    assert parser.events(bybit_book("delta", 13, [(98, 1)])) == []
+    in_sync = feed.chained(bybit._sequence)()
+    assert in_sync(bybit_book("snapshot", 10)) and in_sync(bybit_book("delta", 11))
+    assert not in_sync(bybit_book("delta", 13))

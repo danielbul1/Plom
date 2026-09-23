@@ -17,6 +17,7 @@ from typing import IO
 from plom.venues import VENUES
 
 FLUSH_EVERY_S = 5.0
+MAX_BACKOFF_S = 60.0
 
 
 def open_text(path: Path, mode: str) -> IO[str]:
@@ -30,10 +31,22 @@ async def record(coin: str, venues: Sequence[str], path: Path, status_every_s: f
     with open_text(path, "a") as out:
 
         async def pump(venue: str) -> None:
-            async for message in VENUES[venue].messages(coin):
-                line = {"venue": venue, "recv_ms": round(time.time() * 1000, 1), "msg": message}
-                out.write(json.dumps(line, separators=(",", ":")) + "\n")
-                counts[venue] += 1
+            """Record one venue forever: a venue that fails (say, refusing our region) is retried with
+            backoff and never stops the others."""
+            backoff = 1.0
+            while True:
+                try:
+                    async for message in VENUES[venue].messages(coin):
+                        line = {"venue": venue, "recv_ms": round(time.time() * 1000, 1), "msg": message}
+                        out.write(json.dumps(line, separators=(",", ":")) + "\n")
+                        counts[venue] += 1
+                        backoff = 1.0
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    print(f"{time.strftime('%H:%M:%S')}  {venue}: {type(error).__name__}: {error}"[:200], flush=True)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, MAX_BACKOFF_S)
 
         async def report() -> None:
             last_status = time.monotonic()

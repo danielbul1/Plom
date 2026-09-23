@@ -102,7 +102,10 @@ The venue is timed by its own timestamps plus its fastest typical delivery delay
 
 ```bash
 uv run plom opportunity data/btc.jsonl.gz --venues bitunix,lighter,hyperliquid --move-bps 1.5
+uv run plom opportunity data/btc.jsonl.gz --venues bitunix --leaders binance,bybit
 ```
+
+The composite leaves out Binance and Bybit, as aggregators do. `--leaders binance,bybit` (also on `leadlag`) adds them, to ask whether seeing the biggest venues moves the composite's signal earlier.
 
 ## Recording
 
@@ -119,8 +122,9 @@ uv run plom opportunity data/btc.jsonl.gz --venues bitunix,lighter,hyperliquid -
 | `blofin` | five levels, first snapshot per 50ms | all | USDT perp; sizes in contracts |
 | `aster` | top of book, first update per 50ms | aggregated | USDT perp, Binance-style API |
 | `binance` | top of book, first update per 50ms | aggregated | USD-M futures; not recorded by default |
+| `bybit` | best bid/ask, first update per 50ms; 50 levels with depth | all | USDT perp; not recorded by default |
 
-By default every venue but Binance is recorded. Lighter refuses connections from some jurisdictions.
+By default every venue but Binance and Bybit is recorded. A venue that fails, for instance by refusing the server's region, is retried with backoff and never stops the others. Lighter refuses connections from some jurisdictions.
 
 ```bash
 uv run plom record BTC data/btc.jsonl.gz

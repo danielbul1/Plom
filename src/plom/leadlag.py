@@ -53,14 +53,16 @@ class Moves:
     """Per ms after the move: the basis-adjusted gap still open (positive: the venue lags)."""
 
 
-def mid_series(path: Path, venues: Sequence[str], grid_ms: int = GRID_MS) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+def mid_series(
+    path: Path, venues: Sequence[str], grid_ms: int = GRID_MS, leaders: Sequence[str] = (),
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     """Each venue's mid sampled on a shared grid of local receive times, holding the last value.
 
     `composite` is the composite of the composite venues not otherwise listed.
     """
     comp = None
     if composite.NAME in venues:
-        comp = composite.Composite(tuple(v for v in composite.VENUES if v not in venues))
+        comp = composite.Composite(tuple(v for v in (*composite.VENUES, *leaders) if v not in venues))
     sources = [v for v in venues if v != composite.NAME] + list(comp.venues if comp else ())
     parsers = {venue: VENUES[venue].Parser() for venue in sources}
     times: dict[str, list[float]] = {venue: [] for venue in venues}
@@ -91,10 +93,15 @@ def mid_series(path: Path, venues: Sequence[str], grid_ms: int = GRID_MS) -> tup
     return grid, sampled
 
 
-def measure(path: Path, reference: str, venues: Sequence[str], move_bps: float = 1.5) -> list[LeadLag]:
+def measure(
+    path: Path, reference: str, venues: Sequence[str], move_bps: float = 1.5, leaders: Sequence[str] = (),
+) -> list[LeadLag]:
     if reference == composite.NAME:
         # Measure each venue against a composite without it, reading the recording once per venue.
-        return [_measure(venue, *mid_series(path, [reference, venue]), reference, move_bps) for venue in venues]
+        return [
+            _measure(venue, *mid_series(path, [reference, venue], leaders=leaders), reference, move_bps)
+            for venue in venues
+        ]
     grid, log_mids = mid_series(path, [reference, *venues])
     return [_measure(venue, grid, log_mids, reference, move_bps) for venue in venues]
 

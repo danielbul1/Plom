@@ -14,6 +14,9 @@ from plom.market import Book
 NAME = "composite"
 VENUES = ("coinbase", "okx", "htx_spot", "htx_perps", "blofin", "aster", "hyperliquid")
 """The venues MattCharts aggregates that we can reach, without Binance or Bybit."""
+LEADERS = ("binance", "bybit")
+"""The biggest venues, which lead price discovery; aggregators leave them out, but for our own use
+they can be added to the composite (`leaders=`)."""
 
 
 class Composite:
