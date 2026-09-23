@@ -5,6 +5,6 @@
     "healthcheckPath": "/api/v1/health",
     "healthcheckTimeout": 120,
     "restartPolicyType": "ALWAYS",
-    "multiRegionConfig": { "asia-southeast1-eqsg3a": { "numReplicas": 1 } }
+    "multiRegionConfig": { "sin": { "numReplicas": 1 } }
   }
 }
