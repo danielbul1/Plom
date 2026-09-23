@@ -13,7 +13,7 @@ from functools import partial
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from plom.hub import candles
@@ -30,7 +30,8 @@ SYNC_BACKFILL_MS = 7 * 86_400_000
 DOM_EVERY_TICKS = 4
 
 
-def create_app(hub: Hub, token: str | None, start_hub: bool = True) -> FastAPI:
+def create_app(hub: Hub, token: str | None, start_hub: bool = True, recordings: Path | None = None) -> FastAPI:
+    """`recordings` is the directory `plom record` writes to, served for download (with the token)."""
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
         if start_hub:
@@ -135,6 +136,21 @@ def create_app(hub: Hub, token: str | None, start_hub: bool = True) -> FastAPI:
     @app.get("/", include_in_schema=False)
     def dashboard() -> HTMLResponse:
         return HTMLResponse(DASHBOARD.read_text(encoding="utf-8"))
+
+    @app.get("/api/v1/recordings", dependencies=[Depends(auth)])
+    def list_recordings() -> dict:
+        files = sorted(recordings.glob("*.jsonl*")) if recordings and recordings.is_dir() else []
+        return {"recordings": [
+            {"name": f.name, "bytes": f.stat().st_size, "modified_ms": round(f.stat().st_mtime * 1000)} for f in files
+        ]}
+
+    @app.get("/api/v1/recordings/{name}", dependencies=[Depends(auth)])
+    def get_recording(name: str) -> FileResponse:
+        path = recordings / name if recordings else None
+        # Only plain names of files directly in the directory: no paths, no "..".
+        if path is None or name != Path(name).name or not name.endswith((".jsonl", ".jsonl.gz")) or not path.is_file():
+            raise HTTPException(404, "no such recording")
+        return FileResponse(path, media_type="application/gzip", filename=name)
 
     backfilling: set[tuple[str, str]] = set()
 

@@ -215,7 +215,7 @@ async def _serve(args: argparse.Namespace) -> None:
 
     data_dir = Path(os.environ.get("PLOM_DATA", "data"))
     hub = Hub(args.coins.split(","), venues, Store(data_dir / "candles.sqlite"))
-    server = uvicorn.Server(uvicorn.Config(create_app(hub, token), host=args.host, port=args.port, log_level="info"))
+    server = uvicorn.Server(uvicorn.Config(create_app(hub, token, recordings=data_dir / "recordings"), host=args.host, port=args.port, log_level="info"))
     await server.serve()
 
 

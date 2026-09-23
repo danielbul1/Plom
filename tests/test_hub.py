@@ -147,3 +147,19 @@ def test_dashboard_and_its_chart_library_are_served_without_a_token(client):
     page = client.get("/")
     assert page.status_code == 200 and "/static/lightweight-charts.js" in page.text
     assert client.get("/static/lightweight-charts.js").status_code == 200
+
+
+def test_recordings_are_listed_and_served_by_plain_name_only(tmp_path):
+    recordings = tmp_path / "recordings"
+    recordings.mkdir()
+    (recordings / "btc_20260923_1200.jsonl.gz").write_bytes(b"data")
+    (tmp_path / "secret.jsonl.gz").write_bytes(b"outside")
+    app = create_app(Hub(["BTC"], list(VENUES)), "secret", start_hub=False, recordings=recordings)
+    with TestClient(app) as client:
+        auth = {"Authorization": "Bearer secret"}
+        assert client.get("/api/v1/recordings").status_code == 401
+        [listed] = client.get("/api/v1/recordings", headers=auth).json()["recordings"]
+        assert listed["name"] == "btc_20260923_1200.jsonl.gz" and listed["bytes"] == 4
+        assert client.get("/api/v1/recordings/btc_20260923_1200.jsonl.gz", headers=auth).content == b"data"
+        for bad in ("..%2Fsecret.jsonl.gz", "%2E%2E%2Fsecret.jsonl.gz", "missing.jsonl.gz", "candles.sqlite"):
+            assert client.get(f"/api/v1/recordings/{bad}", headers=auth).status_code == 404
