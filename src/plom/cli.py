@@ -18,6 +18,8 @@ from plom.profiles import DEFAULT_PROFILE, PROFILES
 from plom.venues import VENUES
 
 BAR_WIDTH = 20
+SERVE_COINS = ("BTC", "ETH", "SOL", "HYPE", "XRP", "DOGE")
+SERVE_VENUES = tuple(dict.fromkeys(("hyperliquid", "orderly", *composite.VENUES)))
 RECORD_VENUES = dict.fromkeys(("hyperliquid", "lighter", "orderly", *composite.VENUES))
 
 
@@ -78,9 +80,15 @@ def main() -> None:
     ll.add_argument("--reference", choices=[*VENUES, composite.NAME], default=composite.NAME)
     ll.add_argument("--venues", default="hyperliquid,lighter,orderly")
 
+    sv = commands.add_parser("serve", help="aggregate live data from every venue and serve it over REST and WebSocket")
+    sv.add_argument("--coins", default=os.environ.get("PLOM_COINS", ",".join(SERVE_COINS)))
+    sv.add_argument("--venues", default=os.environ.get("PLOM_VENUES", ",".join(SERVE_VENUES)))
+    sv.add_argument("--host", default="0.0.0.0")
+    sv.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")))
+
     args = parser.parse_args()
     command = {
-        "pressure": _pressure, "mm": _mm, "record": _record, "compare": _compare, "leadlag": _leadlag,
+        "pressure": _pressure, "mm": _mm, "record": _record, "compare": _compare, "leadlag": _leadlag, "serve": _serve,
     }[args.command]
     try:
         asyncio.run(command(args))
@@ -184,6 +192,27 @@ async def _leadlag(args: argparse.Namespace) -> None:
 
     venues = [v for v in args.venues.split(",") if v != args.reference]
     print(leadlag.format_report(args.reference, leadlag.measure(args.replay, args.reference, venues)))
+
+
+async def _serve(args: argparse.Namespace) -> None:
+    import logging
+
+    import uvicorn
+
+    from plom.hub.api import create_app
+    from plom.hub.runner import Hub
+
+    venues = args.venues.split(",")
+    unknown = set(venues) - set(VENUES)
+    if unknown:
+        raise SystemExit(f"unknown venues: {', '.join(sorted(unknown))}")
+    token = os.environ.get("PLOM_TOKEN")
+    if token is None:
+        print("PLOM_TOKEN is not set: the API is open to anyone who can reach it", flush=True)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    hub = Hub(args.coins.split(","), venues)
+    server = uvicorn.Server(uvicorn.Config(create_app(hub, token), host=args.host, port=args.port, log_level="info"))
+    await server.serve()
 
 
 async def _replay(path: Path, venue: str, reference: str | None) -> AsyncIterator[runner.Event]:

@@ -117,6 +117,23 @@ Replays pick one venue with `--venue` (default `hyperliquid`). Older Hyperliquid
 
 Caveats: our orders never move the real market, queue position is estimated from visible (aggregated) size, and latencies are fixed estimates until measured against live orders.
 
+## Hub
+
+`plom serve` streams every venue for several coins at once and serves the aggregate over REST and WebSocket, like the aggregator APIs sold to traders, but from our own direct feeds (tens to hundreds of milliseconds old rather than seconds).
+
+```bash
+PLOM_TOKEN=... uv run plom serve --coins BTC,ETH,SOL --port 8000
+curl -H "Authorization: Bearer $PLOM_TOKEN" "localhost:8000/api/v1/market/tick?symbol=BTC-USD"
+```
+
+- `GET /api/v1/market/tick`: the composite price, each fresh venue's mid, spread, age and learned basis, and volume over the last second.
+- `GET /api/v1/market/dom`: every venue's book summed into price buckets (`bucket`, default about 1bp), with each level's size by venue. Venues trade at different levels, so the raw merge can look crossed; `adjusted=true` first moves each venue onto the composite's level.
+- `GET /api/v1/market/tape`: recent trades from every venue, sizes in coins (contract venues are scaled by their contract size), paged by `after_seq`.
+- `snapshot`, `snapshot/batch`, `latest`, `universe`, `status` (each feed's state) and `health` (no token needed).
+- WebSocket `/api/ws?token=...`: send `{"event": "subscribe_symbols", "symbols": ["BTC-USD"]}` to receive `tick` every 250ms, new `tape` prints and `dom` every second.
+
+The token comes from `PLOM_TOKEN`; without it the API is open. `PLOM_COINS`, `PLOM_VENUES` and `PORT` set the defaults for `--coins`, `--venues` and `--port`.
+
 ## Tests
 
 ```bash
