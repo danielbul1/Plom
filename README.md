@@ -22,7 +22,7 @@ Quotes both sides around the mid and simulates fills against the real book and t
 - **Spread**: the inner layer sits `--base-half-spread-bps` from the reservation price, widened to `--vol-multiplier` x one-second volatility when that is larger.
 - **Fair price**: quotes centre on the mid, moved `--microprice-weight` of the way to the microprice once top-of-book size imbalance reaches `--microprice-imbalance`.
 - **Regimes**: recent volatility over its `--vol-baseline-half-life-s` baseline. Below `--calm-below` is calm (tighter, bigger, slower TTL); above `--chaotic-above` is chaotic (wider, smaller, `--chaotic-layers` deeper-spaced layers with size backloaded harder, faster TTL). The `--calm-*` and `--chaotic-*` multipliers set how much.
-- **Reference price**: with `--reference binance` (the default), fair value moves `--reference-weight` of the way from the local price to the reference mid adjusted by a learned basis (`--basis-half-life-s`). Reference books are put on the venue's clock through our local receive time. A reference move of `--reference-jump-bps` within `--reference-jump-window-ms` pulls the side it runs towards until the venue's next book and widens quotes. `--reference none` quotes on the venue alone.
+- **Reference price**: with `--reference composite` (the default), fair value moves `--reference-weight` of the way from the local price to a composite reference adjusted by a learned basis (`--basis-half-life-s`). The composite is built like the aggregated price charting services show, from Coinbase, OKX, HTX spot and perps, BloFin, Aster and Hyperliquid, leaving out the venue being quoted: each venue's mid is moved onto a common level by its own slowly learned basis, and the composite is the median of the venues heard from in the last second (see `src/plom/composite.py`). A single venue such as `--reference binance` also works. Reference books are put on the venue's clock through our local receive time. A reference move of `--reference-jump-bps` within `--reference-jump-window-ms` pulls the side it runs towards until the venue's next book and widens quotes. `--reference none` quotes on the venue alone.
 - **Forecast**: an online ridge regression predicts the mid's move over `--alpha-horizon-ms` from the reference gap, top-of-book order-flow imbalance, trade-flow imbalance and microprice (see `src/plom/alpha.py`). It learns only from moves that have already happened, so its reported R² is out of sample. `--alpha-weight` shifts fair value by the forecast, `--alpha-widen` widens the side it moves against, and a side is pulled while the forecast move against it exceeds its half spread plus maker fee plus `--alpha-pull-margin-bps`. By default it learns and reports without acting.
 - **Inventory skew**: quotes shift against the position by up to `--inventory-skew-bps` at `--max-position`.
 - **GLFT**: with `--glft-gamma` above 0, the half spread and inventory skew come from the closed-form GLFT approximation (Guéant, Lehalle and Fernandez-Tapia) instead of `--vol-multiplier` and `--inventory-skew-bps`, with `--base-half-spread-bps` as a floor. Its fill intensity A exp(-k δ) is calibrated online, as in hftbacktest: every `--glft-sample-ms`, how far beyond fair value trades reached on each side, decayed over `--glft-half-life-s` and fitted at `--glft-step-bps` steps (see `src/plom/glft.py`). Inventory counts in lots of `--order-size`, so gamma is per bp per lot. Layers step out by `--glft-layer-spacing` GLFT half spreads instead of growing geometrically. With gamma 0 (the default) it calibrates and reports A and k without quoting from them.
@@ -74,7 +74,7 @@ uv run plom compare data/btc.jsonl.gz --profile lighter-standard --grid base-hal
 
 ## Rechecking every stage
 
-`scripts/recheck.py` replays a recording under the defaults and each B4-B7 idea (reference weight, forecast use, GLFT, position age and flattening, bipower volatility and Lee-Mykland jumps) for several venue profiles in parallel, and writes one Markdown report: the differences the data can see, lead-lag, a table per stage and venue, and the defaults' full evaluation. A recording still being written can be used.
+`scripts/recheck.py` replays a recording, against the composite reference unless `--reference` says otherwise, under the defaults and each B4-B7 idea (reference weight, forecast use, GLFT, position age and flattening, bipower volatility and Lee-Mykland jumps) for several venue profiles in parallel, and writes one Markdown report: the differences the data can see, lead-lag, a table per stage and venue, and the defaults' full evaluation. A recording still being written can be used.
 
 ```bash
 uv run python scripts/recheck.py data/btc.jsonl.gz
@@ -83,7 +83,7 @@ uv run python scripts/recheck.py data/btc.jsonl.gz --profiles hyperliquid,lighte
 
 ## Lead-lag
 
-`plom leadlag` measures, from a multi-venue recording, how far each venue's mid lags the reference (peak cross-correlation of mid returns on a 25ms grid of receive times), and how much of the basis-adjusted gap each venue closes over the next 250ms to 5s.
+`plom leadlag` measures, from a multi-venue recording, how far each venue's mid lags the reference (by default the composite, built without the venue being measured) (peak cross-correlation of mid returns on a 25ms grid of receive times), and how much of the basis-adjusted gap each venue closes over the next 250ms to 5s.
 
 ```bash
 uv run plom leadlag data/btc.jsonl.gz
@@ -96,13 +96,20 @@ uv run plom leadlag data/btc.jsonl.gz
 | Venue | Book | Trades | Notes |
 |---|---|---|---|
 | `hyperliquid` | full L2 snapshots, ~0.5s | all | subscribes with the undocumented `fast` flag |
-| `binance` | top of book, first update per 50ms | aggregated | USD-M futures, used as a reference price |
 | `lighter` | snapshot + deltas, ~50ms | all, incl. liquidations | local book rebuilt from nonce-chained deltas |
 | `orderly` | snapshot + deltas, ~200ms | all | local book rebuilt from `prevTs`-chained deltas |
+| `coinbase` | 50 levels, snapshot + deltas batched every 50ms | all | spot BTC-USD, in real dollars |
+| `okx` | top of book, first update per 50ms | all | USDT perp; sizes in contracts |
+| `htx_spot`, `htx_perps` | top of book, first update per 50ms | all | gzip frames; perp book sizes in contracts |
+| `blofin` | five levels, first snapshot per 50ms | all | USDT perp; sizes in contracts |
+| `aster` | top of book, first update per 50ms | aggregated | USDT perp, Binance-style API |
+| `binance` | top of book, first update per 50ms | aggregated | USD-M futures; not recorded by default |
+
+By default every venue but Binance is recorded. Lighter refuses connections from some jurisdictions.
 
 ```bash
 uv run plom record BTC data/btc.jsonl.gz
-uv run plom record BTC data/btc.jsonl.gz --venues hyperliquid,binance
+uv run plom record BTC data/btc.jsonl.gz --venues hyperliquid,coinbase,okx
 uv run plom mm BTC --replay data/btc.jsonl.gz --venue lighter
 ```
 

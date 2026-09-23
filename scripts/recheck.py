@@ -19,12 +19,11 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
 
-from plom import evaluate, leadlag, runner
+from plom import composite, evaluate, leadlag, runner
 from plom.cli import breakdown
 from plom.mm import Config, MarketMaker
 from plom.profiles import PROFILES
 
-REFERENCE = "binance"
 DEFAULT_PROFILES = ("hyperliquid", "lighter-standard", "orderly-raydium")
 EXPERIMENTS: dict[str, list[dict[str, float]]] = {
     "B4 reference price": [
@@ -56,12 +55,12 @@ EXPERIMENTS: dict[str, list[dict[str, float]]] = {
 }
 
 
-def run(path: Path, venue: str, config: Config, label: str, block_s: float, detailed: bool) -> tuple[evaluate.Evaluation, str]:
+def run(path: Path, venue: str, reference: str, config: Config, label: str, block_s: float, detailed: bool) -> tuple[evaluate.Evaluation, str]:
     """Replay one variant; with `detailed`, also return its full evaluation and breakdown as text."""
     mm = MarketMaker(config)
     tracker = evaluate.Tracker(block_s)
     dispatcher = runner.Dispatcher(mm)
-    for is_reference, recv_ms, event in runner.replay(path, venue, REFERENCE):
+    for is_reference, recv_ms, event in runner.replay(path, venue, reference):
         dispatcher.feed(is_reference, recv_ms, event)
         tracker.observe(mm)
     result = evaluate.evaluate(mm, tracker, label)
@@ -73,6 +72,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("replay", type=Path)
     parser.add_argument("--profiles", default=",".join(DEFAULT_PROFILES), help="comma-separated venue profiles")
+    parser.add_argument("--reference", default=composite.NAME, help="reference venue, or composite (the default)")
     parser.add_argument("--block-s", type=float, default=evaluate.BLOCK_S)
     parser.add_argument("--workers", type=int, default=os.cpu_count())
     parser.add_argument("--out", type=Path, help="default: recheck-<time>.md next to the recording")
@@ -91,33 +91,33 @@ def main() -> None:
             profile = PROFILES[name]
             base = replace(Config(), **profile.config)
             key = (name, "", "defaults")
-            futures[pool.submit(run, args.replay, profile.venue, base, "defaults", args.block_s, True)] = key
+            futures[pool.submit(run, args.replay, profile.venue, args.reference, base, "defaults", args.block_s, True)] = key
             for experiment, variants in EXPERIMENTS.items():
                 for overrides in variants:
                     label = " ".join(f"{flag}={value:g}" for flag, value in overrides.items())
                     config = replace(base, **overrides)
-                    futures[pool.submit(run, args.replay, profile.venue, config, label, args.block_s, False)] = (name, experiment, label)
+                    futures[pool.submit(run, args.replay, profile.venue, args.reference, config, label, args.block_s, False)] = (name, experiment, label)
         print(f"{len(futures)} replays of {args.replay} on {args.workers} workers", flush=True)
         venues = sorted({PROFILES[name].venue for name in profiles})
-        lead_lag = leadlag.format_report(REFERENCE, leadlag.measure(args.replay, REFERENCE, venues))
+        lead_lag = leadlag.format_report(args.reference, leadlag.measure(args.replay, args.reference, venues))
         for done, future in enumerate(as_completed(futures), 1):
             name, experiment, label = futures[future]
             runs.append((name, experiment, label, *future.result()))
             print(f"  {done}/{len(futures)}  {name}  {label}", flush=True)
 
-    report = format_report(args.replay, profiles, runs, lead_lag, args.block_s, time.monotonic() - started)
+    report = format_report(args.replay, args.reference, profiles, runs, lead_lag, args.block_s, time.monotonic() - started)
     out.write_text(report, encoding="utf-8")
     print(f"\nwrote {out}")
 
 
-def format_report(path, profiles, runs, lead_lag, block_s, elapsed_s) -> str:
+def format_report(path, reference, profiles, runs, lead_lag, block_s, elapsed_s) -> str:
     by_key = {(name, label): (result, text) for name, _, label, result, text in runs}
     first = by_key[(profiles[0], "defaults")][0]
     lines = [
         f"# Recheck of `{path.name}`",
         "",
         f"{time.strftime('%Y-%m-%d %H:%M')}: {first.hours:.2f}h of market time in {len(first.block_pnls)} blocks of "
-        f"{block_s:g}s, {len(runs)} replays in {elapsed_s / 60:.1f} minutes. Reference: {REFERENCE}.",
+        f"{block_s:g}s, {len(runs)} replays in {elapsed_s / 60:.1f} minutes. Reference: {reference}.",
         "",
         "Intervals are 95% block bootstraps. *vs defaults* pairs each block with the same block under the "
         "profile's defaults; **better** or **worse** means that interval excludes zero. "

@@ -9,7 +9,7 @@ from dataclasses import fields, replace
 from pathlib import Path
 from statistics import fmean
 
-from plom import evaluate, recording, runner
+from plom import composite, evaluate, recording, runner
 from plom.alpha import FEATURES
 from plom.market import Book, Trade
 from plom.mm import Config, MarketMaker, edge_bps
@@ -18,6 +18,7 @@ from plom.profiles import DEFAULT_PROFILE, PROFILES
 from plom.venues import VENUES
 
 BAR_WIDTH = 20
+RECORD_VENUES = dict.fromkeys(("hyperliquid", "lighter", "orderly", *composite.VENUES))
 
 
 def main() -> None:
@@ -39,8 +40,8 @@ def main() -> None:
     )
     m.add_argument("--replay", type=Path, help="recording written by `plom record`")
     m.add_argument(
-        "--reference", choices=[*VENUES, "none"], default="binance",
-        help="venue whose books pull fair value (default binance; none to quote on the venue alone)",
+        "--reference", choices=[*VENUES, composite.NAME, "none"], default=composite.NAME,
+        help="venue whose books pull fair value (default: the composite; none to quote on the venue alone)",
     )
     m.add_argument("--status-every-s", type=float, default=5.0)
     m.add_argument("--block-s", type=float, default=evaluate.BLOCK_S, help="bootstrap block length")
@@ -51,7 +52,10 @@ def main() -> None:
     r = commands.add_parser("record", help="save live books and trades from several venues to one file")
     r.add_argument("coin")
     r.add_argument("path", type=Path, help="JSONL file to append to; .gz compresses it")
-    r.add_argument("--venues", default=",".join(VENUES), help="comma-separated, default: all")
+    r.add_argument(
+        "--venues", default=",".join(RECORD_VENUES),
+        help=f"comma-separated from {', '.join(VENUES)}; default: the quoting venues and the composite's",
+    )
     r.add_argument("--status-every-s", type=float, default=60.0)
 
     k = commands.add_parser("compare", help="replay a recording under several configs, in parallel, and compare")
@@ -59,8 +63,8 @@ def main() -> None:
     k.add_argument("--venue", choices=[v for v in VENUES if v in DEFAULT_PROFILE])
     k.add_argument("--profile", choices=PROFILES)
     k.add_argument(
-        "--reference", choices=[*VENUES, "none"], default="binance",
-        help="venue whose books pull fair value (default binance; none to quote on the venue alone)",
+        "--reference", choices=[*VENUES, composite.NAME, "none"], default=composite.NAME,
+        help="venue whose books pull fair value (default: the composite; none to quote on the venue alone)",
     )
     k.add_argument(
         "--grid", action="append", default=[], metavar="FLAG=V1,V2,...",
@@ -71,7 +75,7 @@ def main() -> None:
 
     ll = commands.add_parser("leadlag", help="how far each venue's mid lags a reference, and how well the gap predicts catch-up")
     ll.add_argument("replay", type=Path)
-    ll.add_argument("--reference", choices=VENUES, default="binance")
+    ll.add_argument("--reference", choices=[*VENUES, composite.NAME], default=composite.NAME)
     ll.add_argument("--venues", default="hyperliquid,lighter,orderly")
 
     args = parser.parse_args()

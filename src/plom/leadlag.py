@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-from plom import recording
+from plom import composite, recording
 from plom.market import Book
 from plom.venues import VENUES
 
@@ -35,17 +35,29 @@ class LeadLag:
 
 
 def mid_series(path: Path, venues: Sequence[str], grid_ms: int = GRID_MS) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    """Each venue's mid sampled on a shared grid of local receive times, holding the last value."""
-    parsers = {venue: VENUES[venue].Parser() for venue in venues}
+    """Each venue's mid sampled on a shared grid of local receive times, holding the last value.
+
+    `composite` is the composite of the composite venues not otherwise listed.
+    """
+    comp = None
+    if composite.NAME in venues:
+        comp = composite.Composite(tuple(v for v in composite.VENUES if v not in venues))
+    sources = [v for v in venues if v != composite.NAME] + list(comp.venues if comp else ())
+    parsers = {venue: VENUES[venue].Parser() for venue in sources}
     times: dict[str, list[float]] = {venue: [] for venue in venues}
     mids: dict[str, list[float]] = {venue: [] for venue in venues}
     for venue, recv_ms, message in recording.read(path):
         if venue not in parsers or recv_ms is None:
             continue
         for event in parsers[venue].events(message):
-            if isinstance(event, Book) and event.bids and event.asks:
+            if not (isinstance(event, Book) and event.bids and event.asks):
+                continue
+            if venue in times:
                 times[venue].append(recv_ms)
                 mids[venue].append((event.bids[0][0] + event.asks[0][0]) / 2)
+            if comp is not None and (book := comp.on_book(venue, recv_ms, event)) is not None:
+                times[composite.NAME].append(recv_ms)
+                mids[composite.NAME].append(book.bids[0][0])
     if any(not times[venue] for venue in venues):
         missing = [venue for venue in venues if not times[venue]]
         raise ValueError(f"no books with receive times for {', '.join(missing)}")
@@ -61,37 +73,41 @@ def mid_series(path: Path, venues: Sequence[str], grid_ms: int = GRID_MS) -> tup
 
 
 def measure(path: Path, reference: str, venues: Sequence[str]) -> list[LeadLag]:
+    if reference == composite.NAME:
+        # Measure each venue against a composite without it, reading the recording once per venue.
+        return [_measure(venue, *mid_series(path, [reference, venue]), reference) for venue in venues]
     grid, log_mids = mid_series(path, [reference, *venues])
+    return [_measure(venue, grid, log_mids, reference) for venue in venues]
+
+
+def _measure(venue: str, grid: np.ndarray, log_mids: dict[str, np.ndarray], reference: str) -> LeadLag:
     ref = log_mids[reference]
     ref_returns = np.diff(ref)
     alpha = 1 - 0.5 ** (GRID_MS / 1000 / BASIS_HALF_LIFE_S)
-    results = []
-    for venue in venues:
-        mid = log_mids[venue]
-        returns = np.diff(mid)
-        correlations = {lag: _lagged_correlation(ref_returns, returns, lag // GRID_MS) for lag in LAGS_MS}
-        peak_lag = max(correlations, key=lambda lag: correlations[lag])
-        basis = _ewma(mid - ref, alpha)  # Causal: uses only the past.
-        gap = ref + basis - mid
-        catch_up = {}
-        warmup = int(BASIS_HALF_LIFE_S * 1000 / GRID_MS)
-        for horizon in HORIZONS_MS:
-            steps = horizon // GRID_MS
-            x = gap[warmup:-steps:4]
-            y = (mid[warmup + steps:] - mid[warmup:-steps])[::4]
-            catch_up[horizon] = _regress_through_origin(x, y)
-        gap_bps = np.abs(gap[warmup:]) * 10_000
-        results.append(LeadLag(
-            venue=venue,
-            minutes=(grid[-1] - grid[0]) / 60_000,
-            peak_lag_ms=peak_lag,
-            peak_correlation=correlations[peak_lag],
-            correlations=correlations,
-            catch_up=catch_up,
-            gap_bps_p50=float(np.percentile(gap_bps, 50)) if gap_bps.size else 0.0,
-            gap_bps_p90=float(np.percentile(gap_bps, 90)) if gap_bps.size else 0.0,
-        ))
-    return results
+    mid = log_mids[venue]
+    returns = np.diff(mid)
+    correlations = {lag: _lagged_correlation(ref_returns, returns, lag // GRID_MS) for lag in LAGS_MS}
+    peak_lag = max(correlations, key=lambda lag: correlations[lag])
+    basis = _ewma(mid - ref, alpha)  # Causal: uses only the past.
+    gap = ref + basis - mid
+    catch_up = {}
+    warmup = int(BASIS_HALF_LIFE_S * 1000 / GRID_MS)
+    for horizon in HORIZONS_MS:
+        steps = horizon // GRID_MS
+        x = gap[warmup:-steps:4]
+        y = (mid[warmup + steps:] - mid[warmup:-steps])[::4]
+        catch_up[horizon] = _regress_through_origin(x, y)
+    gap_bps = np.abs(gap[warmup:]) * 10_000
+    return LeadLag(
+        venue=venue,
+        minutes=(grid[-1] - grid[0]) / 60_000,
+        peak_lag_ms=peak_lag,
+        peak_correlation=correlations[peak_lag],
+        correlations=correlations,
+        catch_up=catch_up,
+        gap_bps_p50=float(np.percentile(gap_bps, 50)) if gap_bps.size else 0.0,
+        gap_bps_p90=float(np.percentile(gap_bps, 90)) if gap_bps.size else 0.0,
+    )
 
 
 def format_report(reference: str, results: Sequence[LeadLag]) -> str:

@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from plom import binance, hyperliquid, lighter, orderly, recording
+from plom import aster, binance, blofin, coinbase, htx, hyperliquid, lighter, okx, orderly, recording
 from plom.market import Book, LocalBook, Trade
 
 
@@ -136,3 +136,65 @@ def test_read_gzip_and_stop_at_a_truncated_tail(tmp_path):
         out.write(json.dumps(line) + "\n")
         out.write('{"venue": "binance", "recv')
     assert list(recording.read(path)) == [("binance", 5.0, {"x": 1})]
+
+
+# Coinbase --------------------------------------------------------------------------------------
+
+def test_coinbase_updates_wait_for_a_snapshot_and_apply_deltas():
+    parser = coinbase.Parser()
+    update = {"type": "l2update", "time": "1970-01-01T00:00:01.5Z", "changes": [["buy", "100.5", "2"], ["sell", "101", "0"]]}
+    assert parser.events(update) == []
+    snapshot = {"type": "snapshot", "bids": [["100", "1"]], "asks": [["101", "1"], ["102", "3"]]}
+    assert parser.events(snapshot) == []
+    assert parser.events(update) == [Book(1500, [(100.5, 2.0), (100.0, 1.0)], [(102.0, 3.0)])]
+
+
+@pytest.mark.parametrize("maker_side, side", [("buy", "sell"), ("sell", "buy")])
+def test_coinbase_match_side_is_the_takers(maker_side, side):
+    message = {"type": "match", "time": "1970-01-01T00:00:00.007Z", "side": maker_side, "price": "100", "size": "0.5"}
+    assert coinbase.Parser().events(message) == [Trade(7, side, 100.0, 0.5)]
+
+
+# OKX -------------------------------------------------------------------------------------------
+
+def test_okx_bbo_and_trades():
+    bbo = {"arg": {"channel": "bbo-tbt"}, "data": [{"asks": [["101", "3", "0", "1"]], "bids": [["100", "2", "0", "1"]], "ts": "9"}]}
+    assert okx.Parser().events(bbo) == [Book(9, [(100.0, 2.0)], [(101.0, 3.0)])]
+    trades = {"arg": {"channel": "trades"}, "data": [{"px": "100.5", "sz": "1.2", "side": "sell", "ts": "11"}]}
+    assert okx.Parser().events(trades) == [Trade(11, "sell", 100.5, 1.2)]
+
+
+# HTX -------------------------------------------------------------------------------------------
+
+def test_htx_spot_bbo_and_trades():
+    bbo = {"ch": "market.btcusdt.bbo", "tick": {"ask": 101.0, "askSize": 3.0, "bid": 100.0, "bidSize": 2.0, "quoteTime": 9}}
+    assert htx.Spot.Parser().events(bbo) == [Book(9, [(100.0, 2.0)], [(101.0, 3.0)])]
+    trade = {"ch": "market.btcusdt.trade.detail", "tick": {"data": [{"ts": 11, "amount": 0.4, "price": 100.5, "direction": "buy"}]}}
+    assert htx.Spot.Parser().events(trade) == [Trade(11, "buy", 100.5, 0.4)]
+
+
+def test_htx_perps_bbo_and_trades_in_coin_quantity():
+    bbo = {"ch": "market.BTC-USDT.bbo", "tick": {"bid": [100.0, 2], "ask": [101.0, 3], "ts": 9}}
+    assert htx.Perps.Parser().events(bbo) == [Book(9, [(100.0, 2)], [(101.0, 3)])]
+    trade = {"ch": "market.BTC-USDT.trade.detail", "tick": {"data": [{"ts": 11, "amount": 4, "quantity": 0.004, "price": 100.5, "direction": "sell"}]}}
+    assert htx.Perps.Parser().events(trade) == [Trade(11, "sell", 100.5, 0.004)]
+
+
+def test_htx_answers_pings_and_decodes_gzip():
+    source = htx._source(htx.Spot.WS_URL, "market.btcusdt")
+    assert source.pong(source.decode(gzip.compress(b'{"ping": 42}'))) == {"pong": 42}
+    assert source.pong({"ch": "market.btcusdt.bbo"}) is None
+
+
+# BloFin and Aster ------------------------------------------------------------------------------
+
+def test_blofin_books5_and_trades():
+    books = {"arg": {"channel": "books5"}, "data": {"asks": [["101", "3"], ["102", "1"]], "bids": [["100", "2"]], "ts": "9"}}
+    assert blofin.Parser().events(books) == [Book(9, [(100.0, 2.0)], [(101.0, 3.0), (102.0, 1.0)])]
+    trades = {"arg": {"channel": "trades"}, "data": [{"price": "100.5", "size": "8", "side": "buy", "ts": "11"}]}
+    assert blofin.Parser().events(trades) == [Trade(11, "buy", 100.5, 8.0)]
+
+
+def test_aster_parses_like_binance():
+    message = {"stream": "btcusdt@bookTicker", "data": {"e": "bookTicker", "b": "100.1", "B": "2", "a": "100.2", "A": "3", "T": 9}}
+    assert aster.Parser().events(message) == [Book(9, [(100.1, 2.0)], [(100.2, 3.0)])]

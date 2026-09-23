@@ -1,5 +1,7 @@
 """Drive a market maker with one venue's books and trades plus a reference venue's books.
 
+The reference is one venue, or the composite of several (see plom.composite).
+
 The market maker runs on the quoting venue's exchange clock. Reference books arrive on another
 venue's clock, so we translate them through our local receive time: a reference book received at
 local time r is treated as happening at r minus the typical delay between the quoting venue's
@@ -12,7 +14,7 @@ from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from plom import recording
+from plom import composite, recording
 from plom.market import Book, Trade
 from plom.mm import MarketMaker
 from plom.venues import VENUES
@@ -42,32 +44,58 @@ class Dispatcher:
             self.mm.on_reference(replace(event, time_ms=round(recv_ms - self.offset_ms)))
 
 
-def replay(path: Path, venue: str, reference: str | None) -> Iterator[Event]:
-    parsers = {venue: VENUES[venue].Parser()}
-    if reference:
-        parsers[reference] = VENUES[reference].Parser()
-    for recorded_venue, recv_ms, message in recording.read(path):
-        parser = parsers.get(recorded_venue)
+class Router:
+    """Parses recorded or live messages into events for the quoting venue and its reference.
+
+    With the composite reference, books from every composite venue except the quoting one feed a
+    Composite, and its books are the reference.
+    """
+
+    def __init__(self, venue: str, reference: str | None) -> None:
+        self.venue = venue
+        self.composite = None
+        references: tuple[str, ...] = ()
+        if reference == composite.NAME:
+            self.composite = composite.Composite(tuple(v for v in composite.VENUES if v != venue))
+            references = self.composite.venues
+        elif reference:
+            references = (reference,)
+        self.parsers = {name: VENUES[name].Parser() for name in (venue, *references)}
+
+    def route(self, source: str, recv_ms: float | None, message: dict) -> list[Event]:
+        parser = self.parsers.get(source)
         if parser is None:
-            continue
-        for event in parser.events(message):
-            yield recorded_venue != venue, recv_ms, event
+            return []
+        events = parser.events(message)
+        if source == self.venue:
+            return [(False, recv_ms, event) for event in events]
+        if self.composite is None:
+            return [(True, recv_ms, event) for event in events]
+        routed = []
+        for event in events:
+            if isinstance(event, Book) and recv_ms is not None:
+                book = self.composite.on_book(source, recv_ms, event)
+                if book is not None:
+                    routed.append((True, recv_ms, book))
+        return routed
+
+
+def replay(path: Path, venue: str, reference: str | None) -> Iterator[Event]:
+    router = Router(venue, reference)
+    for source, recv_ms, message in recording.read(path):
+        yield from router.route(source, recv_ms, message)
 
 
 async def live(venue: str, reference: str | None, coin: str) -> AsyncIterator[Event]:
     """Merge the venue's and the reference's live streams, stamping each event with its receive time."""
-    queue: asyncio.Queue[Event] = asyncio.Queue()
+    router = Router(venue, reference)
+    queue: asyncio.Queue[tuple[str, float, dict]] = asyncio.Queue()
 
-    async def pump(name: str, is_reference: bool) -> None:
-        parser = VENUES[name].Parser()
+    async def pump(name: str) -> None:
         async for message in VENUES[name].messages(coin):
-            recv_ms = time.time() * 1000
-            for event in parser.events(message):
-                queue.put_nowait((is_reference, recv_ms, event))
+            queue.put_nowait((name, time.time() * 1000, message))
 
-    tasks = [asyncio.create_task(pump(venue, False))]
-    if reference:
-        tasks.append(asyncio.create_task(pump(reference, True)))
+    tasks = [asyncio.create_task(pump(name)) for name in router.parsers]
     try:
         while True:
             getter = asyncio.create_task(queue.get())
@@ -76,7 +104,8 @@ async def live(venue: str, reference: str | None, coin: str) -> AsyncIterator[Ev
                 getter.cancel()
                 for task in done:
                     task.result()
-            yield getter.result()
+            for event in router.route(*getter.result()):
+                yield event
     finally:
         for task in tasks:
             task.cancel()
