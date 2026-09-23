@@ -13,6 +13,7 @@ import numpy as np
 
 from plom import composite
 from plom.hub.candles import LiveCandles
+from plom.hub.liquidations import LiquidationModel
 from plom.market import Book, Trade
 
 FRESH_MS = 5000
@@ -67,6 +68,7 @@ class SymbolState:
     def __init__(self, symbol: str, venues: tuple[str, ...], started_ms: float = 0.0) -> None:
         self.symbol = symbol
         self.candles = LiveCandles(started_ms)
+        self.liquidations = LiquidationModel()
         self.composite = composite.Composite(venues)  # Every venue, so each gets a basis for the adjusted book.
         self.books: dict[str, tuple[float, Book]] = {}
         self.tape: deque[Print] = deque(maxlen=TAPE_SIZE)
@@ -88,6 +90,7 @@ class SymbolState:
         self.tape.append(Print(self.seq, recv_ms, venue, trade))
         adjusted = trade.price * math.exp(-self.composite.basis.get(venue, 0.0))
         self.candles.on_trade(trade.time_ms, adjusted, trade.size, trade.side)
+        self.liquidations.on_trade(venue, trade.side, adjusted, trade.size)
 
     def fresh_books(self, now_ms: float) -> dict[str, tuple[float, Book]]:
         return {v: (t, b) for v, (t, b) in self.books.items() if now_ms - t <= FRESH_MS}

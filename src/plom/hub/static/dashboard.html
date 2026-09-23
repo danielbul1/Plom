@@ -70,7 +70,7 @@
     <div class="body"><div id="chart"></div></div>
   </section>
   <section>
-    <h2>Heatmap · merged book, basis-adjusted <span class="right muted" id="heatInfo"></span></h2>
+    <h2><span class="tabs" id="views"></span><span class="right muted" id="heatInfo"></span></h2>
     <div class="body"><canvas id="heatmap"></canvas></div>
   </section>
   <div id="side">
@@ -238,7 +238,72 @@ function heatColor(t) {
   return `rgb(${c[0]},${c[1]},${c[2]})`;
 }
 
+let view = store.get("plom_view") || "heatmap", liq = null;
+const VIEWS = { heatmap: "Heatmap", liquidations: "Liquidation map" };
+function pickView(v) {
+  view = v;
+  store.set("plom_view", v);
+  tabs($("views"), Object.keys(VIEWS), view, pickView);
+  [...$("views").children].forEach((b, i) => { b.textContent = Object.values(VIEWS)[i]; });
+  redraw();
+}
+function redraw() { view === "heatmap" ? drawHeatmap() : drawLiquidations(); }
+
+async function loadLiquidations() {
+  const [levels, real] = await Promise.all([
+    api(`/api/v1/premium/liquidation_clusters?symbol=${symbol}&bucket_pct=0.25`),
+    api(`/api/v1/premium/liquidations?symbol=${symbol}&limit=500`),
+  ]);
+  liq = { levels, real: real.liquidations };
+  if (view === "liquidations") drawLiquidations();
+}
+
+function drawLiquidations() {
+  const width = canvas.clientWidth, height = canvas.clientHeight, dpr = devicePixelRatio || 1;
+  if (canvas.width !== width * dpr || canvas.height !== height * dpr) { canvas.width = width * dpr; canvas.height = height * dpr; }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = "#0b0d12";
+  ctx.fillRect(0, 0, width, height);
+  if (!liq || !liq.levels.price) return;
+  const { price, bucket, longs, shorts } = liq.levels;
+  const range = 0.08;  // Show 8% either side of the price.
+  const top = price * (1 + range), bottom = price * (1 - range);
+  const y = (p) => ((top - p) / (top - bottom)) * height;
+  const all = longs.concat(shorts).filter(([p]) => p > bottom && p < top);
+  const biggest = Math.max(...all.map(([, n]) => n), 1);
+  const barHeight = Math.max(1, (bucket / (top - bottom)) * height);
+  const left = 70, maxWidth = width - left - 10;
+  for (const [levels, color] of [[longs, "rgba(239,83,80,.85)"], [shorts, "rgba(38,166,154,.85)"]]) {
+    ctx.fillStyle = color;
+    for (const [p, n] of levels) {
+      if (p <= bottom || p >= top) continue;
+      ctx.fillRect(left, y(p + bucket), (n / biggest) * maxWidth, barHeight);
+    }
+  }
+  // Real liquidations in the last hour, as dots at their price: size by notional.
+  const since = Date.now() - 3_600_000;
+  for (const l of liq.real) {
+    if (l.ts_ms < since || l.price <= bottom || l.price >= top) continue;
+    ctx.fillStyle = l.position === "long" ? "#ffb4b0" : "#9ef0e4";
+    ctx.beginPath();
+    ctx.arc(left - 12, y(l.price), Math.min(8, 2 + Math.log10(1 + l.notional / 1000) * 2), 0, 2 * Math.PI);
+    ctx.fill();
+  }
+  ctx.strokeStyle = "#e3b341";
+  ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(0, y(price)); ctx.lineTo(width, y(price)); ctx.stroke();
+  ctx.fillStyle = "#7c8595";
+  ctx.font = "11px ui-monospace, monospace";
+  for (let i = -4; i <= 4; i++) {
+    const p = price * (1 + (i * range) / 5);
+    ctx.fillText(fmt(p, 0), 4, y(p) + 4);
+  }
+  const sum = (xs) => xs.reduce((a, [, n]) => a + n, 0);
+  $("heatInfo").textContent = `estimated · longs $${fmt(sum(longs) / 1e6, 0)}M below · shorts $${fmt(sum(shorts) / 1e6, 0)}M above · dots: real liquidations, last hour`;
+}
+
 function drawHeatmap() {
+  if (view !== "heatmap") return;
   const width = canvas.clientWidth, height = canvas.clientHeight, dpr = devicePixelRatio || 1;
   if (canvas.width !== width * dpr || canvas.height !== height * dpr) { canvas.width = width * dpr; canvas.height = height * dpr; }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -290,7 +355,7 @@ async function loadHeatmap() {
   columns = data.columns;
   drawHeatmap();
 }
-new ResizeObserver(drawHeatmap).observe(canvas);
+new ResizeObserver(() => redraw()).observe(canvas);
 $("ladder").parentElement.addEventListener("wheel", (e) => { e.currentTarget.dataset.userScrolled = "1"; }, { passive: true });
 $("ladder").parentElement.addEventListener("dblclick", (e) => { delete e.currentTarget.dataset.userScrolled; });
 
@@ -326,7 +391,8 @@ async function start() {
   const pickInterval = (i) => { interval = i; store.set("plom_interval", i); tabs($("intervals"), INTERVALS, interval, pickInterval); loadHistory(); };
   tabs($("intervals"), INTERVALS, interval, pickInterval);
   try {
-    await Promise.all([loadHistory(), loadHeatmap()]);
+    pickView(view);
+    await Promise.all([loadHistory(), loadHeatmap(), loadLiquidations()]);
     connect();
   } catch (error) {
     if (!token) askToken();
@@ -335,6 +401,7 @@ async function start() {
 
 if (!token) askToken(); else start();
 setInterval(() => { if (token) refreshLastCandles().catch(() => {}); }, 2000);
+setInterval(() => { if (token) loadLiquidations().catch(() => {}); }, 15000);
 </script>
 </body>
 </html>

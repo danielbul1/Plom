@@ -97,6 +97,29 @@ def create_app(hub: Hub, token: str | None, start_hub: bool = True, recordings: 
         columns = state(symbol).heatmap_since(now_ms(), seconds, step)
         return {"symbol": symbol.upper(), "levels": HEATMAP_LEVELS, "adjusted": True, "columns": [c.to_json() for c in columns]}
 
+    @app.get("/api/v1/premium/liquidation_clusters", dependencies=[Depends(auth)])
+    def liquidation_clusters(
+        symbol: str, bucket_pct: float = Query(0.1, gt=0, le=5), min_notional: float = Query(0.0, ge=0),
+    ) -> dict:
+        """Estimated liquidation notional by price: longs below the price, shorts above (a model)."""
+        s = state(symbol)
+        return {"symbol": s.symbol, "model": "estimated", **s.liquidations.levels(round(now_ms()), bucket_pct, min_notional)}
+
+    @app.get("/api/v1/premium/position_zones", dependencies=[Depends(auth)])
+    def position_zones(
+        symbol: str, window_s: float = Query(3600, gt=0, le=86_400), bucket_pct: float = Query(0.1, gt=0, le=5),
+    ) -> dict:
+        """Where the most positions were opened recently, by entry price (estimated from open interest)."""
+        s = state(symbol)
+        zones = s.liquidations.position_zones(round(now_ms()), window_s, bucket_pct)
+        return {"symbol": s.symbol, "window_s": window_s, "zones": zones}
+
+    @app.get("/api/v1/premium/liquidations", dependencies=[Depends(auth)])
+    def liquidations(symbol: str, limit: int = Query(200, ge=1, le=2000)) -> dict:
+        """Real forced liquidations reported by Binance, Bybit and OKX, newest last."""
+        recent = list(state(symbol).liquidations.liquidations)[-limit:]
+        return {"symbol": symbol.upper(), "liquidations": [l.to_json() for l in recent]}
+
     @app.get("/api/v1/market/tape", dependencies=[Depends(auth)])
     def tape(symbol: str, after_seq: int = 0, limit: int = Query(200, ge=1, le=5000)) -> dict:
         prints = state(symbol).prints_after(after_seq, limit)

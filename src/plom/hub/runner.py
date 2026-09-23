@@ -5,7 +5,7 @@ import logging
 import time
 from dataclasses import replace
 
-from plom.hub import candles, contracts
+from plom.hub import candles, contracts, positioning
 from plom.hub.state import SymbolState
 from plom.market import Book, Trade
 from plom.venues import VENUES
@@ -19,6 +19,7 @@ DEPTH_STREAMS = {"okx", "blofin", "htx_spot", "htx_perps", "aster", "bitunix", "
 DEEP_PARSERS = {"okx", "blofin", "coinbase", "orderly", "bybit"}
 CANDLE_FLUSH_S = 5.0
 REPAIR_EVERY_S = 300.0
+SEED_HOURS = 72.0
 DAY_MS = 86_400_000
 INITIAL_BACKFILL = {"1m": DAY_MS, "15m": 14 * DAY_MS, "1h": 90 * DAY_MS, "4h": 365 * DAY_MS, "1d": 5 * 365 * DAY_MS}
 
@@ -32,12 +33,20 @@ class Hub:
         self.status: dict[tuple[str, str], str] = {}
         """(symbol, venue) -> "connecting", "live", "not listed" or the last error."""
         self._tasks: list[asyncio.Task] = []
+        self._seeded: set[str] = set()
 
     def start(self) -> None:
         for symbol in self.states:
             for venue in self.venues:
                 self._tasks.append(asyncio.create_task(self._run(symbol, venue)))
         self._tasks.append(asyncio.create_task(self._sample()))
+        for symbol in self.states:
+            for venue in positioning.OI_SOURCES:
+                if venue in self.venues:
+                    self._tasks.append(asyncio.create_task(self._positioning(symbol, venue, "oi")))
+            for venue in positioning.LIQUIDATION_SOURCES:
+                if venue in self.venues:
+                    self._tasks.append(asyncio.create_task(self._positioning(symbol, venue, "liquidations")))
         if self.store is not None:
             self._tasks.append(asyncio.create_task(self._flush_candles()))
             self._tasks.append(asyncio.create_task(self._initial_backfill()))
@@ -94,6 +103,52 @@ class Hub:
         for task in self._tasks:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+
+    async def _seed(self, symbol: str, coin: str, model) -> None:
+        """Replay OKX's recent 5-minute history into the model, so its zones don't start empty.
+
+        Each change in open interest is paired with the flow and range of the interval before it."""
+        rows = await asyncio.to_thread(positioning.okx_history, coin, SEED_HOURS)
+        if rows:
+            first = rows[0]
+            model.on_interval("okx", first[0], first[1], 0.0, 0.0, first[4], first[5], first[6])  # The baseline.
+        for previous, row in zip(rows, rows[1:]):
+            _, _, buy, sell, low, high, price = previous
+            model.on_interval("okx", row[0], row[1], buy, sell, low, high, price)
+        self._seeded.add(symbol)
+        log.info("seeded %s liquidation model from %d OKX intervals", symbol, len(rows))
+
+    async def _positioning(self, symbol: str, venue: str, kind: str) -> None:
+        """Feed a venue's open interest or liquidations into the symbol's liquidation model, forever."""
+        coin, model, key = coin_of(symbol), self.states[symbol].liquidations, (symbol, f"{venue} {kind}")
+        backoff = 1.0
+        while True:
+            self.status[key] = "connecting"
+            try:
+                if kind == "oi":
+                    if venue == "okx" and symbol not in self._seeded:
+                        await self._seed(symbol, coin, model)
+                    stream, parse = positioning.OI_SOURCES[venue]
+                    async for message in stream(coin):
+                        for reading in parse(message):
+                            model.on_open_interest(reading)
+                        self.status[key] = "live"
+                        backoff = 1.0
+                else:
+                    stream, parse = positioning.LIQUIDATION_SOURCES[venue]
+                    contract = await asyncio.to_thread(contracts.contract_size, venue, coin) or 1.0
+                    async for message in stream(coin):
+                        for liquidation in parse(message, coin, contract):
+                            model.on_liquidation(liquidation)
+                        self.status[key] = "live"
+                        backoff = 1.0
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self.status[key] = f"{type(error).__name__}: {error}"[:200]
+                log.warning("%s %s %s: %s; retrying in %.0fs", symbol, venue, kind, self.status[key], backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, MAX_BACKOFF_S)
 
     async def _run(self, symbol: str, venue: str) -> None:
         coin, state, key = coin_of(symbol), self.states[symbol], (symbol, venue)
