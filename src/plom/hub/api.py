@@ -8,13 +8,20 @@ import asyncio
 import contextlib
 import secrets
 import time
+from functools import partial
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 
+from plom.hub import candles
 from plom.hub.runner import Hub
 from plom.hub.state import HEATMAP_LEVELS, HEATMAP_SECONDS, SymbolState
 
 TICK_EVERY_S = 0.25
+HISTORY_MAX = 2000
+BACKFILL_BELOW = 0.8
+"""Backfill a history window holding fewer than this share of its candles."""
+SYNC_BACKFILL_MS = 7 * 86_400_000
+"""Windows up to this long wait for their backfill; longer ones get it in the background."""
 DOM_EVERY_TICKS = 4
 
 
@@ -117,6 +124,41 @@ def create_app(hub: Hub, token: str | None, start_hub: bool = True) -> FastAPI:
         wanted = [s.strip() for s in symbols.split(",") if s.strip()][:50]
         parts = set(include.split(","))
         return {"snapshots": {state(s).symbol: snapshot_of(state(s), parts) for s in wanted}}
+
+    backfilling: set[tuple[str, str]] = set()
+
+    @app.get("/api/history/{symbol}", dependencies=[Depends(auth)])
+    async def history(
+        symbol: str, interval: str = "1m", from_ms: int | None = Query(None, alias="from"),
+        to_ms: int | None = Query(None, alias="to"), limit: int = Query(500, ge=1, le=HISTORY_MAX),
+    ) -> dict:
+        s = state(symbol)
+        if hub.store is None:
+            raise HTTPException(503, "no candle store configured")
+        length = candles.INTERVALS.get(interval)
+        if length is None:
+            raise HTTPException(400, f"interval must be one of {', '.join(candles.INTERVALS)}")
+        to_ms = to_ms or int(now_ms())
+        from_ms = max(from_ms or to_ms - 86_400_000, to_ms - limit * length)
+        found = hub.store.read(s.symbol, interval, from_ms, to_ms)
+        expected = max(1, (to_ms - from_ms) // length)
+        key = (s.symbol, interval)
+        if len(found) < BACKFILL_BELOW * expected and key not in backfilling:
+            fill = partial(candles.backfill, hub.store, s.symbol, interval, from_ms, to_ms, dict(s.composite.basis))
+            backfilling.add(key)
+            if to_ms - from_ms <= SYNC_BACKFILL_MS:
+                try:
+                    await asyncio.to_thread(fill)
+                finally:
+                    backfilling.discard(key)
+                found = hub.store.read(s.symbol, interval, from_ms, to_ms)
+            else:
+                task = asyncio.create_task(asyncio.to_thread(fill))
+                task.add_done_callback(lambda _: backfilling.discard(key))
+        return {
+            "symbol": s.symbol, "interval": interval, "from_ms": from_ms, "to_ms": to_ms, "count": len(found),
+            "backfilling": key in backfilling, "candles": [c.to_json() for c in found],
+        }
 
     @app.websocket("/api/ws")
     async def ws(socket: WebSocket, token_param: str | None = Query(None, alias="token")) -> None:

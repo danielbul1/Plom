@@ -5,7 +5,7 @@ import logging
 import time
 from dataclasses import replace
 
-from plom.hub import contracts
+from plom.hub import candles, contracts
 from plom.hub.state import SymbolState
 from plom.market import Book, Trade
 from plom.venues import VENUES
@@ -17,12 +17,18 @@ BOOK_LEVELS = 200
 DEPTH_STREAMS = {"okx", "blofin", "htx_spot", "htx_perps", "aster"}
 """Venues that stream only the top of book unless asked for depth."""
 DEEP_PARSERS = {"okx", "blofin", "coinbase", "orderly"}
+CANDLE_FLUSH_S = 5.0
+REPAIR_EVERY_S = 300.0
+DAY_MS = 86_400_000
+INITIAL_BACKFILL = {"1m": DAY_MS, "15m": 14 * DAY_MS, "1h": 90 * DAY_MS, "4h": 365 * DAY_MS, "1d": 5 * 365 * DAY_MS}
 
 
 class Hub:
-    def __init__(self, coins: list[str], venues: list[str]) -> None:
+    def __init__(self, coins: list[str], venues: list[str], store: candles.Store | None = None) -> None:
         self.venues = tuple(venues)
-        self.states = {symbol_of(coin): SymbolState(symbol_of(coin), self.venues) for coin in coins}
+        self.store = store
+        started_ms = time.time() * 1000
+        self.states = {symbol_of(coin): SymbolState(symbol_of(coin), self.venues, started_ms) for coin in coins}
         self.status: dict[tuple[str, str], str] = {}
         """(symbol, venue) -> "connecting", "live", "not listed" or the last error."""
         self._tasks: list[asyncio.Task] = []
@@ -32,6 +38,49 @@ class Hub:
             for venue in self.venues:
                 self._tasks.append(asyncio.create_task(self._run(symbol, venue)))
         self._tasks.append(asyncio.create_task(self._sample()))
+        if self.store is not None:
+            self._tasks.append(asyncio.create_task(self._flush_candles()))
+            self._tasks.append(asyncio.create_task(self._initial_backfill()))
+            self._tasks.append(asyncio.create_task(self._repair_partials()))
+
+    async def _repair_partials(self) -> None:
+        """Candles that began before we started only saw part of their trades: once they close,
+        replace them with backfilled ones."""
+        while True:
+            await asyncio.sleep(REPAIR_EVERY_S)
+            now_ms = int(time.time() * 1000)
+            for symbol, state in self.states.items():
+                for interval, length in candles.INTERVALS.items():
+                    opens = self.store.closed_partials(symbol, interval, now_ms)
+                    if not opens:
+                        continue
+                    try:
+                        await asyncio.to_thread(
+                            candles.backfill, self.store, symbol, interval, min(opens), max(opens) + length - 1,
+                            dict(state.composite.basis),
+                        )
+                    except Exception as error:
+                        log.warning("repairing %s %s candles failed: %s", symbol, interval, error)
+
+    async def _flush_candles(self) -> None:
+        while True:
+            await asyncio.sleep(CANDLE_FLUSH_S)
+            for symbol, state in self.states.items():
+                state.candles.flush(symbol, self.store)
+
+    async def _initial_backfill(self) -> None:
+        """Give charts some history from the start: fill each window's gaps once."""
+        await asyncio.sleep(30)  # Let each venue's basis settle first.
+        now_ms = int(time.time() * 1000)
+        for symbol, state in self.states.items():
+            for interval, span_ms in INITIAL_BACKFILL.items():
+                try:
+                    count = await asyncio.to_thread(
+                        candles.backfill, self.store, symbol, interval, now_ms - span_ms, now_ms, dict(state.composite.basis),
+                    )
+                    log.info("backfilled %d %s candles for %s", count, interval, symbol)
+                except Exception as error:
+                    log.warning("backfill %s %s failed: %s", symbol, interval, error)
 
     async def _sample(self) -> None:
         """Take a heatmap column for every symbol at the top of each second."""

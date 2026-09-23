@@ -130,8 +130,11 @@ curl -H "Authorization: Bearer $PLOM_TOKEN" "localhost:8000/api/v1/market/tick?s
 - `GET /api/v1/market/dom`: every venue's book summed into price buckets (`bucket`, default about 1bp), with each level's size by venue. Venues trade at different levels, so the raw merge can look crossed; `adjusted=true` first moves each venue onto the composite's level.
 - `GET /api/v1/market/heatmap`: one column a second of the adjusted merged book, for up to 30 minutes (`seconds`, thinned by `step`). Each column is a price grid of 300 buckets centred on the composite price (bucket i is `low + i * bucket`), with bid and ask size per bucket. Venues lead and lag each other by about a basis point, more than any one venue's spread, so bids and asks overlap slightly near the price.
 - `GET /api/v1/market/tape`: recent trades from every venue, sizes in coins (contract venues are scaled by their contract size), paged by `after_seq`.
+- `GET /api/history/{symbol}`: OHLCV candles (`interval` 1m, 5m, 15m, 1h, 4h or 1d; `from` and `to` in Unix ms, default the last 24 hours; `limit` up to 2,000) with taker buy and sell volume and trade counts. See below.
 - `snapshot`, `snapshot/batch`, `latest`, `universe`, `status` (each feed's state) and `health` (no token needed).
 - WebSocket `/api/ws?token=...`: send `{"event": "subscribe_symbols", "symbols": ["BTC-USD"]}` to receive `tick` every 250ms, new `tape` prints, and `dom` and the newest `heatmap` column every second.
+
+Candles are built live from every venue's trades, with each venue's prices moved onto the composite's level by its basis, and kept in SQLite under `PLOM_DATA` (default `data/`). On start, and whenever a requested window is less than 80% covered, gaps are backfilled from Coinbase (no 4h) and Hyperliquid (its latest 5,000 candles only): highs and lows across both, opens and closes their median. Backfilled candles cover two venues rather than all of them and carry no buy/sell split, so their volume is lower than live candles'. A live candle whose interval began before the hub started is marked `partial`, and is replaced by a backfilled one once it closes. Windows over 7 days return what is stored at once with `"backfilling": true`.
 
 The token comes from `PLOM_TOKEN`; without it the API is open. `PLOM_COINS`, `PLOM_VENUES` and `PORT` set the defaults for `--coins`, `--venues` and `--port`.
 

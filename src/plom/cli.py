@@ -210,7 +210,10 @@ async def _serve(args: argparse.Namespace) -> None:
     if token is None:
         print("PLOM_TOKEN is not set: the API is open to anyone who can reach it", flush=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    hub = Hub(args.coins.split(","), venues)
+    from plom.hub.candles import Store
+
+    data_dir = Path(os.environ.get("PLOM_DATA", "data"))
+    hub = Hub(args.coins.split(","), venues, Store(data_dir / "candles.sqlite"))
     server = uvicorn.Server(uvicorn.Config(create_app(hub, token), host=args.host, port=args.port, log_level="info"))
     await server.serve()
 
