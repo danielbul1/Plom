@@ -88,6 +88,9 @@ class Config:
     """A reference move this large within reference_jump_window_ms counts as a jump and pulls the side
     it runs towards until the venue's next book."""
     reference_jump_window_ms: int = 250
+    reference_jump_hold_ms: int = 0
+    """Keep a side pulled by a reference jump at least this long, even past the venue's next book:
+    a venue that sends books every few hundred milliseconds can still be stale on the next one."""
 
     alpha_horizon_ms: int = 1000
     """The online forecast predicts the mid's move over this horizon (see plom.alpha)."""
@@ -259,7 +262,8 @@ class MarketMaker:
     pulled_ms: dict[Side, int] = field(default_factory=lambda: {"buy": 0, "sell": 0})
     """Time each side spent pulled by a trend or a sweep."""
     swept: dict[Side, bool] = field(default_factory=lambda: {"buy": False, "sell": False})
-    """A trade jumped through this side since the last book, so its quotes are pulled until a fresh one."""
+    """A trade jumped through this side since the last book, or the reference jumped towards it, so its
+    quotes are pulled until a fresh book (and, for a reference jump, reference_jump_hold_ms)."""
     jumps: int = 0
     regime_ms: dict[Regime, int] = field(default_factory=lambda: {"calm": 0, "normal": 0, "chaotic": 0})
 
@@ -297,6 +301,7 @@ class MarketMaker:
         self._last_flatten_ms: int | None = None
         self._basis_ms: int | None = None
         self._reference_mids: deque[tuple[int, float]] = deque()
+        self._swept_until_ms: dict[Side, int] = {"buy": 0, "sell": 0}
         horizons = {*self.config.markout_horizons_ms, self.config.pickoff_horizon_ms}
         self._unsettled: dict[int, deque[Fill]] = {h: deque() for h in horizons}
 
@@ -374,7 +379,7 @@ class MarketMaker:
                     self.pulled_ms[side] += elapsed
         self._last_book_ms = self.now_ms
         was_swept = any(self.swept.values())
-        self.swept = {"buy": False, "sell": False}
+        self.swept = {side: self.now_ms < self._swept_until_ms[side] for side in SIDES}
         previous_mid, trend, bias, regime = self.mid, self.trend, self.bias, self.regime
         self._update_mid(book)
         self.local_fair = fair_price(book, self.config)
@@ -416,7 +421,9 @@ class MarketMaker:
         jumped = abs(move_bps) >= c.reference_jump_bps
         if jumped:
             self.reference_jumps += 1
-            self.swept["sell" if move_bps > 0 else "buy"] = True
+            side = "sell" if move_bps > 0 else "buy"
+            self.swept[side] = True
+            self._swept_until_ms[side] = self.now_ms + c.reference_jump_hold_ms
             self._start_jump()
             window.clear()
             window.append((self.now_ms, self.reference_mid))

@@ -65,3 +65,22 @@ def test_dispatcher_translates_reference_time_through_receive_time():
     dispatcher.feed(False, 1150.0, book(1000))  # The venue's feed reaches us 150ms after its timestamps.
     dispatcher.feed(True, 1300.0, ref(9_999_999, 99.0))
     assert mm.reference_ms == 1150
+
+
+@pytest.mark.parametrize("hold_ms, pulled_at_300", [(0, False), (500, True)])
+def test_a_jump_can_hold_its_pull_past_the_next_venue_book(hold_ms, pulled_at_300):
+    mm = with_basis(replace(REFERENCE, reference_jump_hold_ms=hold_ms))
+    mm.on_reference(ref(100, 99.0297))  # +3 bps: pull the asks.
+    assert mm.swept["sell"]
+    mm.on_book(book(300))
+    assert mm.swept["sell"] is pulled_at_300 and not mm.swept["buy"]
+    mm.on_book(book(700))
+    assert not mm.swept["sell"]
+
+
+def test_bitunix_profiles_carry_its_fees_and_ticks():
+    from plom.profiles import DEFAULT_PROFILE, PROFILES
+
+    assert DEFAULT_PROFILE["bitunix"] == "bitunix"
+    assert PROFILES["bitunix"].config["tick_size"] == 0.1 and PROFILES["bitunix-eth"].config["tick_size"] == 0.01
+    assert PROFILES["bitunix"].config["maker_fee_bps"] == 2.0

@@ -1,4 +1,4 @@
-"""Re-run the B4-B7 comparisons on a recording and write one Markdown report.
+"""Re-run the B4-B8 comparisons on a recording and write one Markdown report.
 
 Each variant changes one idea against a venue profile's defaults and replays the recording in its own
 process. Its PnL is compared with the defaults block by block (a paired block bootstrap), so a
@@ -24,7 +24,7 @@ from plom.cli import breakdown
 from plom.mm import Config, MarketMaker
 from plom.profiles import PROFILES
 
-DEFAULT_PROFILES = ("hyperliquid", "lighter-standard", "orderly-raydium")
+DEFAULT_PROFILES = ("hyperliquid", "lighter-standard", "orderly-raydium", "bitunix")
 EXPERIMENTS: dict[str, list[dict[str, float]]] = {
     "B4 reference price": [
         {"reference_weight": 0.0},
@@ -51,6 +51,19 @@ EXPERIMENTS: dict[str, list[dict[str, float]]] = {
         {"jump_alpha": 0.01},
         {"jump_bps": math.inf},
         {"jump_alpha": 0.01, "jump_bps": math.inf},
+    ],
+    "B8 lagging venue": [
+        {"reference_jump_bps": math.inf},
+        {"reference_jump_bps": 1.0},
+        {"reference_jump_bps": 1.5},
+        {"reference_jump_bps": 3.0},
+        {"reference_jump_hold_ms": 250},
+        {"reference_jump_hold_ms": 500},
+        {"reference_jump_bps": 1.5, "reference_jump_hold_ms": 500},
+        {"reference_weight": 1.0, "reference_jump_bps": 1.5, "reference_jump_hold_ms": 500},
+        {"cancel_latency_ms": 50},
+        {"cancel_latency_ms": 300},
+        {"cancel_latency_ms": 500},
     ],
 }
 

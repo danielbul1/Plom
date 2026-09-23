@@ -1,7 +1,7 @@
 """Per-venue execution assumptions for the paper market maker.
 
 Latencies are ~150ms of network round trip from here (measured on public feeds) plus any delay the
-venue adds on purpose. Tick sizes are for BTC. Figures as documented in September 2026:
+venue adds on purpose. Tick sizes are for BTC unless the profile says otherwise. Figures as documented in September 2026:
 - Hyperliquid: base tier 1.5 bps maker / 4.5 bps taker.
   https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees
 - Lighter Standard: no fees, but 60 transactions a minute, a 300ms cancel delay and a maker delay
@@ -9,6 +9,11 @@ venue adds on purpose. Tick sizes are for BTC. Figures as documented in Septembe
   https://apidocs.lighter.xyz/docs/account-types
 - Orderly via Raydium Perps: 0 bps maker / 4.5 bps taker, 10 order requests a second.
   https://docs.raydium.io/user-flows/perpetuals-trading-fees
+- Bitunix: VIP 1 (a 300 USDT balance is enough) 2 bps maker / 5 bps taker; 10 order modifications
+  a second. Ticks 0.1 for BTC and 0.01 for ETH, from quotePrecision in /futures/market/trading_pairs.
+  Its order and cancel latency are unmeasured: we assume the network round trip alone.
+  https://www.bitunix.com/service/handling-fee
+  https://www.bitunix.com/api-docs/futures/trade/modify_order.html
 """
 
 from dataclasses import dataclass, field
@@ -50,7 +55,23 @@ PROFILES = {
             "order_latency_ms": NETWORK_MS, "cancel_latency_ms": NETWORK_MS, "tx_per_minute": 600,
         },
     ),
+    "bitunix": Profile(
+        "bitunix",
+        {
+            "tick_size": 0.1, "maker_fee_bps": 2.0, "taker_fee_bps": 5.0,
+            "order_latency_ms": NETWORK_MS, "cancel_latency_ms": NETWORK_MS, "tx_per_minute": 600,
+        },
+    ),
+    "bitunix-eth": Profile(
+        "bitunix",
+        {
+            "tick_size": 0.01, "maker_fee_bps": 2.0, "taker_fee_bps": 5.0,
+            "order_latency_ms": NETWORK_MS, "cancel_latency_ms": NETWORK_MS, "tx_per_minute": 600,
+        },
+    ),
 }
 
-DEFAULT_PROFILE = {"hyperliquid": "hyperliquid", "lighter": "lighter-standard", "orderly": "orderly-raydium"}
+DEFAULT_PROFILE = {
+    "hyperliquid": "hyperliquid", "lighter": "lighter-standard", "orderly": "orderly-raydium", "bitunix": "bitunix",
+}
 """The profile used for a venue when none is named."""
