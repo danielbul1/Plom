@@ -136,6 +136,8 @@ curl -H "Authorization: Bearer $PLOM_TOKEN" "localhost:8000/api/v1/market/tick?s
 
 Candles are built live from every venue's trades, with each venue's prices moved onto the composite's level by its basis, and kept in SQLite under `PLOM_DATA` (default `data/`). On start, and whenever a requested window is less than 80% covered, gaps are backfilled from Coinbase (no 4h) and Hyperliquid (its latest 5,000 candles only): highs and lows across both, opens and closes their median. Backfilled candles cover two venues rather than all of them and carry no buy/sell split, so their volume is lower than live candles'. A live candle whose interval began before the hub started is marked `partial`, and is replaced by a backfilled one once it closes. Windows over 7 days return what is stored at once with `"backfilling": true`.
 
+The dashboard at `/` shows it all live for BTC and ETH: candles with volume coloured by the taker side, a heatmap of the adjusted merged book with the composite price over it, each venue's mid, spread and age against the composite, the merged book as a ladder with each level's size split by venue, and the tape. It asks for the token once (or takes `?token=`) and keeps it in the browser. The chart library (TradingView Lightweight Charts, Apache 2.0) is served from the hub itself.
+
 The token comes from `PLOM_TOKEN`; without it the API is open. `PLOM_COINS`, `PLOM_VENUES` and `PORT` set the defaults for `--coins`, `--venues` and `--port`.
 
 ## Tests

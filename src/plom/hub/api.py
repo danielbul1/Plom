@@ -10,12 +10,17 @@ import secrets
 import time
 from functools import partial
 
+from pathlib import Path
+
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 
 from plom.hub import candles
 from plom.hub.runner import Hub
 from plom.hub.state import HEATMAP_LEVELS, HEATMAP_SECONDS, SymbolState
 
+DASHBOARD = Path(__file__).parent / "static" / "dashboard.html"
 TICK_EVERY_S = 0.25
 HISTORY_MAX = 2000
 BACKFILL_BELOW = 0.8
@@ -125,6 +130,12 @@ def create_app(hub: Hub, token: str | None, start_hub: bool = True) -> FastAPI:
         parts = set(include.split(","))
         return {"snapshots": {state(s).symbol: snapshot_of(state(s), parts) for s in wanted}}
 
+    app.mount("/static", StaticFiles(directory=DASHBOARD.parent), name="static")
+
+    @app.get("/", include_in_schema=False)
+    def dashboard() -> HTMLResponse:
+        return HTMLResponse(DASHBOARD.read_text(encoding="utf-8"))
+
     backfilling: set[tuple[str, str]] = set()
 
     @app.get("/api/history/{symbol}", dependencies=[Depends(auth)])
@@ -168,12 +179,14 @@ def create_app(hub: Hub, token: str | None, start_hub: bool = True) -> FastAPI:
         await socket.accept()
         subscribed: dict[str, int] = {}
         """Symbol -> the last tape sequence number sent."""
+        options = {"adjusted": False}
 
         async def receive() -> None:
             while True:
                 message = await socket.receive_json()
                 symbols = [s.upper() for s in message.get("symbols", []) if s.upper() in hub.states]
                 if message.get("event") == "subscribe_symbols":
+                    options["adjusted"] = bool(message.get("adjusted", options["adjusted"]))
                     for s in symbols:
                         subscribed.setdefault(s, hub.states[s].seq)
                 elif message.get("event") == "unsubscribe_symbols":
@@ -195,7 +208,7 @@ def create_app(hub: Hub, token: str | None, start_hub: bool = True) -> FastAPI:
                         subscribed[symbol] = prints[-1].seq
                         await socket.send_json({"event": "tape", "symbol": symbol, "data": [p.to_json() for p in prints]})
                     if count % DOM_EVERY_TICKS == 0:
-                        await socket.send_json({"event": "dom", "data": s.dom(now)})
+                        await socket.send_json({"event": "dom", "data": s.dom(now, adjusted=options["adjusted"])})
                         if s.heatmap and s.heatmap[-1].ts_ms > last_column.get(symbol, 0):
                             last_column[symbol] = s.heatmap[-1].ts_ms
                             await socket.send_json({"event": "heatmap", "symbol": symbol, "data": s.heatmap[-1].to_json()})

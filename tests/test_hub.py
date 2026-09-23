@@ -141,3 +141,9 @@ def test_heatmap_columns_put_bids_and_asks_on_one_grid_around_the_price():
 def test_api_heatmap(client):
     response = client.get("/api/v1/market/heatmap?symbol=BTC-USD&token=secret").json()
     assert response["columns"] == [] and response["levels"] > 0
+
+
+def test_dashboard_and_its_chart_library_are_served_without_a_token(client):
+    page = client.get("/")
+    assert page.status_code == 200 and "/static/lightweight-charts.js" in page.text
+    assert client.get("/static/lightweight-charts.js").status_code == 200

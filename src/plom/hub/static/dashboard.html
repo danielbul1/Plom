@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plom Hub</title>
+<script src="/static/lightweight-charts.js"></script>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #0b0d12; --panel: #12151c; --line: #1f2430; --text: #d7dce5; --muted: #7c8595;
+    --bid: #26a69a; --ask: #ef5350; --accent: #e3b341;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 13px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  header { display: flex; align-items: center; gap: 16px; padding: 8px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  header h1 { font-size: 14px; margin: 0; letter-spacing: .3px; }
+  .price { font: 600 20px var(--mono); }
+  .muted { color: var(--muted); }
+  .tabs { display: flex; gap: 4px; }
+  .tabs button { background: transparent; color: var(--muted); border: 1px solid var(--line); border-radius: 5px; padding: 3px 9px; cursor: pointer; font: inherit; }
+  .tabs button.active { color: var(--text); border-color: var(--accent); }
+  #status { margin-left: auto; font-size: 12px; }
+  #status.ok::before { content: "●"; color: var(--bid); margin-right: 5px; }
+  #status.bad::before { content: "●"; color: var(--ask); margin-right: 5px; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 380px; grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); gap: 1px; background: var(--line); height: calc(100vh - 49px); }
+  section { background: var(--panel); display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  section h2 { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin: 0; padding: 7px 12px; border-bottom: 1px solid var(--line); display: flex; gap: 10px; align-items: center; }
+  section h2 .right { margin-left: auto; text-transform: none; letter-spacing: 0; font-weight: 400; }
+  .body { flex: 1; min-height: 0; position: relative; }
+  #chart, #heatmap { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  #side { grid-row: 1 / 3; grid-column: 2; display: grid; grid-template-rows: auto minmax(0, 1.3fr) minmax(0, 1fr); gap: 1px; background: var(--line); }
+  table { width: 100%; border-collapse: collapse; font: 12px var(--mono); }
+  td, th { padding: 2px 10px; text-align: right; white-space: nowrap; }
+  th { color: var(--muted); font-weight: 400; font-family: system-ui, sans-serif; font-size: 11px; }
+  td:first-child, th:first-child { text-align: left; }
+  .scroll { overflow: auto; }
+  .ladder td { position: relative; }
+  .ladder .bar { position: absolute; top: 1px; bottom: 1px; right: 0; opacity: .22; }
+  .ladder tr.mid td { border-top: 1px solid var(--accent); }
+  .buy { color: var(--bid); } .sell { color: var(--ask); }
+  .big { font-weight: 700; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 6px; vertical-align: 0; }
+  #login { position: fixed; inset: 0; background: rgba(0,0,0,.7); display: none; align-items: center; justify-content: center; }
+  #login form { background: var(--panel); border: 1px solid var(--line); padding: 20px; border-radius: 8px; display: flex; gap: 8px; }
+  #login input { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 5px; padding: 6px 10px; width: 280px; font: inherit; }
+  #login button { background: var(--accent); border: 0; border-radius: 5px; padding: 6px 14px; font: inherit; cursor: pointer; }
+  @media (max-width: 900px) {
+    main { display: flex; flex-direction: column; height: auto; }
+    main > section { height: 420px; }
+    #side { display: flex; flex-direction: column; }
+    #side > section { height: 380px; }
+    #side > section:first-child { height: auto; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Plom Hub</h1>
+  <div class="tabs" id="symbols"></div>
+  <span class="price" id="price">—</span>
+  <span class="muted" id="volume"></span>
+  <div class="tabs" id="intervals"></div>
+  <span id="status" class="bad">connecting</span>
+</header>
+<main>
+  <section>
+    <h2>Chart <span class="right muted" id="chartInfo"></span></h2>
+    <div class="body"><div id="chart"></div></div>
+  </section>
+  <section>
+    <h2>Heatmap · merged book, basis-adjusted <span class="right muted" id="heatInfo"></span></h2>
+    <div class="body"><canvas id="heatmap"></canvas></div>
+  </section>
+  <div id="side">
+    <section>
+      <h2>Venues <span class="right muted">vs composite</span></h2>
+      <table id="venues"><thead><tr><th>venue</th><th>mid</th><th>Δ bps</th><th>spread</th><th>age</th></tr></thead><tbody></tbody></table>
+    </section>
+    <section>
+      <h2>Order book · merged <span class="right muted" id="domInfo"></span></h2>
+      <div class="body scroll"><table class="ladder" id="ladder"><tbody></tbody></table></div>
+    </section>
+    <section>
+      <h2>Tape <span class="right muted" id="tapeInfo"></span></h2>
+      <div class="body scroll"><table id="tape"><tbody></tbody></table></div>
+    </section>
+  </div>
+</main>
+<div id="login"><form><input id="tokenInput" type="password" placeholder="PLOM_TOKEN" autocomplete="current-password"><button>Connect</button></form></div>
+
+<script>
+const SYMBOLS = ["BTC-USD", "ETH-USD"];
+const INTERVALS = ["1m", "5m", "15m", "1h", "4h", "1d"];
+const VENUE_COLORS = {
+  coinbase: "#4c8dff", okx: "#d7dce5", hyperliquid: "#58e6c1", htx_spot: "#3aa0d8", htx_perps: "#1f6fa3",
+  blofin: "#e3b341", aster: "#c084fc", orderly: "#f472b6", lighter: "#a3e635", binance: "#f0b90b",
+};
+const LADDER_ROWS = 25;
+const HEAT_COLUMNS = 300;
+const HEAT_BUCKETS = 70;  // Buckets each side of the price shown.
+
+const store = {
+  get(key) { try { return localStorage.getItem(key); } catch { return null; } },
+  set(key, value) { try { localStorage.setItem(key, value); } catch {} },
+};
+const params = new URLSearchParams(location.search);
+let token = params.get("token") || store.get("plom_token") || "";
+let symbol = store.get("plom_symbol") || SYMBOLS[0];
+let interval = store.get("plom_interval") || "1m";
+let socket = null, lastTick = null, columns = [], tapeRows = [];
+
+const $ = (id) => document.getElementById(id);
+const fmt = (x, digits = 2) => x == null ? "—" : x.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+const priceDigits = () => symbol.startsWith("BTC") ? 1 : 2;
+const api = async (path) => {
+  const response = await fetch(path, { headers: { Authorization: `Bearer ${token}` } });
+  if (response.status === 401) { askToken(); throw new Error("unauthorized"); }
+  return response.json();
+};
+
+function askToken() {
+  $("login").style.display = "flex";
+  $("tokenInput").focus();
+}
+$("login").querySelector("form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  token = $("tokenInput").value.trim();
+  store.set("plom_token", token);
+  $("login").style.display = "none";
+  start();
+});
+
+function tabs(el, values, current, onPick) {
+  el.innerHTML = "";
+  for (const value of values) {
+    const button = document.createElement("button");
+    button.textContent = value.replace("-USD", "");
+    button.className = value === current ? "active" : "";
+    button.onclick = () => onPick(value);
+    el.appendChild(button);
+  }
+}
+
+// Chart -----------------------------------------------------------------------------------------
+const chart = LightweightCharts.createChart($("chart"), {
+  autoSize: true,
+  layout: { background: { color: "transparent" }, textColor: "#7c8595", fontFamily: "system-ui" },
+  grid: { vertLines: { color: "#161a23" }, horzLines: { color: "#161a23" } },
+  timeScale: { timeVisible: true, secondsVisible: false, borderColor: "#1f2430" },
+  rightPriceScale: { borderColor: "#1f2430" },
+  crosshair: { mode: 0 },
+});
+const candles = chart.addCandlestickSeries({ upColor: "#26a69a", downColor: "#ef5350", borderVisible: false, wickUpColor: "#26a69a", wickDownColor: "#ef5350" });
+const volume = chart.addHistogramSeries({ priceScaleId: "vol", priceFormat: { type: "volume" } });
+chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } });
+
+const toBar = (c) => ({ time: c.open_ms / 1000, open: c.open, high: c.high, low: c.low, close: c.close });
+const toVolume = (c) => ({
+  time: c.open_ms / 1000, value: c.volume,
+  color: c.buy_volume == null ? "#3a4150" : (c.buy_volume >= c.sell_volume ? "rgba(38,166,154,.5)" : "rgba(239,83,80,.5)"),
+});
+
+async function loadHistory() {
+  const data = await api(`/api/history/${symbol}?interval=${interval}&limit=1000&from=0`);
+  candles.setData(data.candles.map(toBar));
+  volume.setData(data.candles.map(toVolume));
+  const live = data.candles.filter((c) => c.source === "live").length;
+  $("chartInfo").textContent = `${data.count} candles · ${live} live${data.backfilling ? " · backfilling…" : ""}`;
+  chart.timeScale().scrollToRealTime();
+}
+
+async function refreshLastCandles() {
+  const data = await api(`/api/history/${symbol}?interval=${interval}&limit=2`);
+  for (const c of data.candles) { candles.update(toBar(c)); volume.update(toVolume(c)); }
+}
+
+// Venues table ----------------------------------------------------------------------------------
+function renderTick(tick) {
+  lastTick = tick;
+  $("price").textContent = fmt(tick.price, priceDigits());
+  $("volume").textContent = `${fmt(tick.volume_1s, 3)} ${symbol.split("-")[0]}/s`;
+  const rows = Object.entries(tick.prices).map(([venue, mid]) => {
+    const delta = tick.price ? (mid / tick.price - 1) * 1e4 : 0;
+    return `<tr><td><span class="dot" style="background:${VENUE_COLORS[venue] || "#888"}"></span>${venue}</td>
+      <td>${fmt(mid, priceDigits())}</td><td class="${delta >= 0 ? "buy" : "sell"}">${delta >= 0 ? "+" : ""}${delta.toFixed(2)}</td>
+      <td>${tick.spreads_bps[venue].toFixed(2)}</td><td>${tick.ages_ms[venue]}ms</td></tr>`;
+  });
+  document.querySelector("#venues tbody").innerHTML = rows.join("");
+}
+
+// Ladder ----------------------------------------------------------------------------------------
+function renderDom(dom) {
+  const asks = dom.asks.slice(0, LADDER_ROWS).reverse(), bids = dom.bids.slice(0, LADDER_ROWS);
+  const biggest = Math.max(...asks.concat(bids).map((l) => l.size), 1e-12);
+  const row = (level, side, first) => {
+    const venues = Object.entries(level.venues).sort((a, b) => b[1] - a[1]);
+    const bars = [];
+    let right = 0;
+    for (const [venue, size] of venues) {
+      const width = (size / biggest) * 100;
+      bars.push(`<span class="bar" style="right:${right}%;width:${width}%;background:${VENUE_COLORS[venue] || "#888"}"></span>`);
+      right += width;
+    }
+    return `<tr class="${first ? "mid" : ""}"><td class="${side}">${fmt(level.price, dom.bucket < 1 ? 2 : 0)}</td>
+      <td>${bars.join("")}${fmt(level.size, 3)}</td><td class="muted">${venues.length}</td></tr>`;
+  };
+  $("ladder").querySelector("tbody").innerHTML =
+    asks.map((l) => row(l, "sell", false)).join("") + bids.map((l, i) => row(l, "buy", i === 0)).join("");
+  $("domInfo").textContent = `bucket ${dom.bucket} · ${dom.venues.length} venues`;
+  const body = $("ladder").parentElement, mid = $("ladder").querySelector("tr.mid");
+  if (mid && !body.dataset.userScrolled) body.scrollTop = mid.offsetTop - body.clientHeight / 2;
+}
+
+// Tape ------------------------------------------------------------------------------------------
+function renderTape(prints) {
+  const threshold = symbol.startsWith("BTC") ? 50_000 : 25_000;
+  for (const p of prints) {
+    if (p.notional < 500) continue;  // Dust.
+    const time = new Date(p.ts_ms).toISOString().slice(11, 23);
+    tapeRows.unshift(`<tr class="${p.side} ${p.notional >= threshold ? "big" : ""}"><td>${time}</td>
+      <td><span class="dot" style="background:${VENUE_COLORS[p.venue] || "#888"}"></span>${p.venue}</td>
+      <td>${fmt(p.price, priceDigits())}</td><td>$${fmt(p.notional, 0)}</td></tr>`);
+  }
+  tapeRows = tapeRows.slice(0, 80);
+  $("tape").querySelector("tbody").innerHTML = tapeRows.join("");
+  $("tapeInfo").textContent = `≥ $500 · bold ≥ $${fmt(threshold, 0)}`;
+}
+
+// Heatmap ---------------------------------------------------------------------------------------
+const canvas = $("heatmap"), ctx = canvas.getContext("2d");
+function heatColor(t) {
+  // Dark blue through purple and orange to pale yellow.
+  const stops = [[11, 13, 18], [30, 40, 110], [140, 50, 150], [235, 120, 50], [255, 240, 170]];
+  const x = Math.min(Math.max(t, 0), 1) * (stops.length - 1), i = Math.min(Math.floor(x), stops.length - 2), f = x - i;
+  const c = stops[i].map((v, k) => Math.round(v + (stops[i + 1][k] - v) * f));
+  return `rgb(${c[0]},${c[1]},${c[2]})`;
+}
+
+function drawHeatmap() {
+  const width = canvas.clientWidth, height = canvas.clientHeight, dpr = devicePixelRatio || 1;
+  if (canvas.width !== width * dpr || canvas.height !== height * dpr) { canvas.width = width * dpr; canvas.height = height * dpr; }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = "#0b0d12";
+  ctx.fillRect(0, 0, width, height);
+  const shown = columns.slice(-HEAT_COLUMNS);
+  if (!shown.length) return;
+  const last = shown[shown.length - 1], bucket = last.bucket;
+  const top = last.price + HEAT_BUCKETS * bucket, bottom = last.price - HEAT_BUCKETS * bucket;
+  const y = (price) => ((top - price) / (top - bottom)) * height;
+  const rowHeight = Math.max(1, height / (2 * HEAT_BUCKETS));
+  const colWidth = width / HEAT_COLUMNS, x0 = width - shown.length * colWidth;
+  // Scale colours by a high percentile of visible sizes, on a log scale.
+  const sizes = [];
+  for (const c of shown) for (let i = 0; i < c.bids.length; i++) { const s = c.bids[i] + c.asks[i]; if (s > 0) sizes.push(s); }
+  sizes.sort((a, b) => a - b);
+  // Colour from the median size (dark) to the 99.5th percentile (bright), on a log scale, so the
+  // few standing walls stand out from ordinary depth.
+  const low = Math.log(sizes[Math.floor(sizes.length * 0.5)] || 1e-9);
+  const high = Math.log(sizes[Math.floor(sizes.length * 0.995)] || 1);
+  const shade = (size) => (Math.log(size) - low) / Math.max(high - low, 1e-9);
+  shown.forEach((c, k) => {
+    const x = x0 + k * colWidth;
+    for (let i = 0; i < c.bids.length; i++) {
+      const size = c.bids[i] + c.asks[i];
+      if (!size) continue;
+      const price = c.low + i * c.bucket;
+      if (price > top || price < bottom) continue;
+      ctx.fillStyle = heatColor(shade(size));
+      ctx.fillRect(x, y(price) - rowHeight / 2, colWidth + 0.5, rowHeight + 0.5);
+    }
+  });
+  ctx.strokeStyle = "#e3b341";
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  shown.forEach((c, k) => { const x = x0 + (k + 0.5) * colWidth; k ? ctx.lineTo(x, y(c.price)) : ctx.moveTo(x, y(c.price)); });
+  ctx.stroke();
+  ctx.fillStyle = "#7c8595";
+  ctx.font = "11px ui-monospace, monospace";
+  for (let i = -HEAT_BUCKETS + 10; i <= HEAT_BUCKETS - 10; i += 20) {
+    const price = last.price + i * bucket;
+    ctx.fillText(fmt(price, priceDigits()), 6, y(price) + 4);
+  }
+  $("heatInfo").textContent = `${shown.length}s · bucket ${bucket}`;
+}
+
+async function loadHeatmap() {
+  const data = await api(`/api/v1/market/heatmap?symbol=${symbol}&seconds=${HEAT_COLUMNS}`);
+  columns = data.columns;
+  drawHeatmap();
+}
+new ResizeObserver(drawHeatmap).observe(canvas);
+$("ladder").parentElement.addEventListener("wheel", (e) => { e.currentTarget.dataset.userScrolled = "1"; }, { passive: true });
+$("ladder").parentElement.addEventListener("dblclick", (e) => { delete e.currentTarget.dataset.userScrolled; });
+
+// Live stream -----------------------------------------------------------------------------------
+function connect() {
+  if (socket) socket.close();
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  socket = new WebSocket(`${scheme}://${location.host}/api/ws?token=${encodeURIComponent(token)}`);
+  const current = symbol;
+  socket.onopen = () => {
+    socket.send(JSON.stringify({ event: "subscribe_symbols", symbols: [current], adjusted: true }));
+    $("status").className = "ok";
+    $("status").textContent = "live";
+  };
+  socket.onclose = (e) => {
+    $("status").className = "bad";
+    $("status").textContent = e.code === 1008 || e.code === 403 ? "bad token" : "reconnecting";
+    if (socket && socket.symbol === current) setTimeout(connect, 2000);
+  };
+  socket.symbol = current;
+  socket.onmessage = (e) => {
+    const message = JSON.parse(e.data);
+    if (socket.symbol !== symbol) return;
+    if (message.event === "tick") renderTick(message.data);
+    else if (message.event === "dom") renderDom(message.data);
+    else if (message.event === "tape") renderTape(message.data);
+    else if (message.event === "heatmap") { columns.push(message.data); columns = columns.slice(-HEAT_COLUMNS); drawHeatmap(); }
+  };
+}
+
+async function start() {
+  tabs($("symbols"), SYMBOLS, symbol, (s) => { symbol = s; store.set("plom_symbol", s); tapeRows = []; start(); });
+  const pickInterval = (i) => { interval = i; store.set("plom_interval", i); tabs($("intervals"), INTERVALS, interval, pickInterval); loadHistory(); };
+  tabs($("intervals"), INTERVALS, interval, pickInterval);
+  try {
+    await Promise.all([loadHistory(), loadHeatmap()]);
+    connect();
+  } catch (error) {
+    if (!token) askToken();
+  }
+}
+
+if (!token) askToken(); else start();
+setInterval(() => { if (token) refreshLastCandles().catch(() => {}); }, 2000);
+</script>
+</body>
+</html>
