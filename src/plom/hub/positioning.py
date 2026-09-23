@@ -12,6 +12,7 @@ reported with the side of the position that was liquidated.
 import asyncio
 import json
 import time
+import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
@@ -165,6 +166,23 @@ OKX_PAGE = 100
 SEED_PERIOD_MS = 300_000
 
 
+OKX_PACE_S = 0.5
+"""OKX allows about five requests every two seconds on its trading statistics endpoints."""
+
+
+def _get_okx(url: str, attempts: int = 6) -> list[list[str]]:
+    """One page, waiting and retrying while OKX says we're asking too often (HTTP 429)."""
+    request = urllib.request.Request(url, headers={"User-Agent": "plom/0.1"})
+    for attempt in range(attempts):
+        try:
+            return json.load(urllib.request.urlopen(request, timeout=20)).get("data", [])
+        except urllib.error.HTTPError as error:
+            if error.code != 429 or attempt == attempts - 1:
+                raise
+            time.sleep(2.0 * (attempt + 1))
+    return []
+
+
 def _okx_pages(path: str, since_ms: int, cursor: str = "end") -> list[list[str]]:
     """Rows of an OKX endpoint that pages backwards, newest first, back to since_ms. The trading
     statistics endpoints take the cursor as `end`, the candle endpoints as `after`."""
@@ -172,15 +190,14 @@ def _okx_pages(path: str, since_ms: int, cursor: str = "end") -> list[list[str]]
     oldest = ""
     while True:
         url = f"{OKX_REST}{path}&limit={OKX_PAGE}{f'&{cursor}={oldest}' if oldest else ''}"
-        request = urllib.request.Request(url, headers={"User-Agent": "plom/0.1"})
-        page = json.load(urllib.request.urlopen(request, timeout=20)).get("data", [])
+        page = _get_okx(url)
         if not page or (oldest and int(page[-1][0]) >= int(oldest)):
             break  # Nothing older: the end of the history, or a cursor the endpoint ignores.
         rows += page
         oldest = page[-1][0]
         if len(page) < OKX_PAGE or int(oldest) <= since_ms:
             break
-        time.sleep(0.2)  # OKX allows a few requests a second on these endpoints.
+        time.sleep(OKX_PACE_S)
     return [r for r in rows if int(r[0]) >= since_ms]
 
 

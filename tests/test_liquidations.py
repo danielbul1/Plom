@@ -86,3 +86,22 @@ def test_replayed_intervals_open_positions_and_clear_crossed_levels():
     model.on_interval("okx", 600_000, 110.0, 0, 0, 99.4, 100.2, 99.8)
     assert not any(c.side == "long" and c.leverage == 100 for c in model.clusters.values())
     assert any(c.side == "long" and c.leverage == 50 for c in model.clusters.values())
+
+
+def test_okx_pages_retry_when_rate_limited(monkeypatch):
+    import io
+    import json
+    import urllib.error
+
+    calls = []
+
+    def fake_urlopen(request, timeout):
+        calls.append(request.full_url)
+        if len(calls) == 1:
+            raise urllib.error.HTTPError(request.full_url, 429, "Too Many Requests", {}, None)
+        return io.BytesIO(json.dumps({"data": [["5", "1"]]}).encode())
+
+    monkeypatch.setattr(positioning.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(positioning.time, "sleep", lambda s: None)
+    assert positioning._get_okx("https://example/x") == [["5", "1"]]
+    assert len(calls) == 2

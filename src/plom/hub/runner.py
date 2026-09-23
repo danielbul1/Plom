@@ -34,6 +34,7 @@ class Hub:
         """(symbol, venue) -> "connecting", "live", "not listed" or the last error."""
         self._tasks: list[asyncio.Task] = []
         self._seeded: set[str] = set()
+        self._seed_lock = asyncio.Lock()
 
     def start(self) -> None:
         for symbol in self.states:
@@ -108,7 +109,12 @@ class Hub:
         """Replay OKX's recent 5-minute history into the model, so its zones don't start empty.
 
         Each change in open interest is paired with the flow and range of the interval before it."""
-        rows = await asyncio.to_thread(positioning.okx_history, coin, SEED_HOURS)
+        async with self._seed_lock:  # One symbol at a time, to stay within OKX's rate limit.
+            try:
+                rows = await asyncio.to_thread(positioning.okx_history, coin, SEED_HOURS)
+            except Exception as error:  # Without history the model still builds from live data.
+                log.warning("seeding %s liquidation model failed: %s", symbol, error)
+                rows = []
         if rows:
             first = rows[0]
             model.on_interval("okx", first[0], first[1], 0.0, 0.0, first[4], first[5], first[6])  # The baseline.
