@@ -81,6 +81,13 @@ def main() -> None:
     ll.add_argument("--venues", default="hyperliquid,lighter,orderly,bitunix")
     ll.add_argument("--move-bps", type=float, default=1.5, help="a reference move this big within 250ms counts as sharp")
 
+    op = commands.add_parser("opportunity", help="what a lagging venue's quotes stand to lose or win around sharp composite moves")
+    op.add_argument("replay", type=Path)
+    op.add_argument("--venues", default="bitunix,lighter,hyperliquid,orderly")
+    op.add_argument("--move-bps", type=float, default=1.5)
+    op.add_argument("--latencies-ms", default="50,150,300")
+    op.add_argument("--fees-bps", default="0,0.4,1.5,2", help="maker fees to net the good side against")
+
     sv = commands.add_parser("serve", help="aggregate live data from every venue and serve it over REST and WebSocket")
     sv.add_argument("--coins", default=os.environ.get("PLOM_COINS", ",".join(SERVE_COINS)))
     sv.add_argument("--venues", default=os.environ.get("PLOM_VENUES", ",".join(SERVE_VENUES)))
@@ -89,7 +96,7 @@ def main() -> None:
 
     args = parser.parse_args()
     command = {
-        "pressure": _pressure, "mm": _mm, "record": _record, "compare": _compare, "leadlag": _leadlag, "serve": _serve,
+        "pressure": _pressure, "mm": _mm, "record": _record, "compare": _compare, "leadlag": _leadlag, "serve": _serve, "opportunity": _opportunity,
     }[args.command]
     try:
         asyncio.run(command(args))
@@ -193,6 +200,20 @@ async def _leadlag(args: argparse.Namespace) -> None:
 
     venues = [v for v in args.venues.split(",") if v != args.reference]
     print(leadlag.format_report(args.reference, leadlag.measure(args.replay, args.reference, venues, args.move_bps)))
+
+
+async def _opportunity(args: argparse.Namespace) -> None:
+    from plom import opportunity
+
+    latencies = [int(x) for x in args.latencies_ms.split(",")]
+    fees = [float(x) for x in args.fees_bps.split(",")]
+    for venue in args.venues.split(","):
+        try:
+            report = opportunity.measure(args.replay, venue, args.move_bps, latencies)
+        except ValueError as error:
+            print(f"--- {venue}: {error}")
+            continue
+        print(opportunity.format_report(report, fees), "\n", flush=True)
 
 
 async def _serve(args: argparse.Namespace) -> None:

@@ -90,6 +90,20 @@ uv run python scripts/recheck.py data/btc.jsonl.gz --profiles hyperliquid,lighte
 uv run plom leadlag data/btc.jsonl.gz
 ```
 
+## Opportunity on a lagging venue
+
+`plom opportunity` asks, before any strategy is built, what a venue's quotes stand to lose or win around the composite's sharp moves (at least `--move-bps` within 250ms), from its own recorded book and trades, for each assumed latency in `--latencies-ms`:
+
+- stale side: how often a quote left at the touch the move runs towards gets hit before our cancel lands, and how far the venue's mid has moved past it two seconds on;
+- favorable side: how often a quote joined at the other touch after the latency fills within 500ms (trades there must exceed the size queued ahead), and its edge;
+- the expected bps per move of each, net of each maker fee in `--fees-bps`.
+
+The venue is timed by its own timestamps plus its fastest typical delivery delay, since venues that batch messages deliver some events long after they happen.
+
+```bash
+uv run plom opportunity data/btc.jsonl.gz --venues bitunix,lighter,hyperliquid --move-bps 1.5
+```
+
 ## Recording
 
 `plom record` saves raw books and trades from several venues into one file, each line tagged with the venue and our local receive time (the only clock shared across venues). A `.gz` path compresses it.
