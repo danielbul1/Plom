@@ -90,6 +90,14 @@ def main() -> None:
     op.add_argument("--fees-bps", default="0,0.4,1.5,2", help="maker fees to net the good side against")
     op.add_argument("--leaders", default="", help=f"add these to the composite, e.g. {','.join(composite.LEADERS)}")
 
+    bo = commands.add_parser("breakout", help="does the liquidation map predict anything? event study and walk-forward backtest on Binance history")
+    bo.add_argument("--coin", default="BTC")
+    bo.add_argument("--since", default="2021-12-01")
+    bo.add_argument("--until", default=None, help="default: yesterday")
+    bo.add_argument("--cache", type=Path, default=Path("data/history/binance"))
+    bo.add_argument("--split-years", default="2024,2025", help="walk-forward: fit on the years before each, test after")
+    bo.add_argument("--fee-bps", type=float, default=11.0, help="per round trip")
+
     sv = commands.add_parser("serve", help="aggregate live data from every venue and serve it over REST and WebSocket")
     sv.add_argument("--coins", default=os.environ.get("PLOM_COINS", ",".join(SERVE_COINS)))
     sv.add_argument("--venues", default=os.environ.get("PLOM_VENUES", ",".join(SERVE_VENUES)))
@@ -99,6 +107,7 @@ def main() -> None:
     args = parser.parse_args()
     command = {
         "pressure": _pressure, "mm": _mm, "record": _record, "compare": _compare, "leadlag": _leadlag, "serve": _serve, "opportunity": _opportunity,
+        "breakout": _breakout,
     }[args.command]
     try:
         asyncio.run(command(args))
@@ -195,6 +204,20 @@ async def _compare(args: argparse.Namespace) -> None:
             f"{e.label:<40} {e.fills:>6} {e.fees:>8.3f} {e.pnl:>+9.3f} {str(e.pnl_per_hour or 'n/a'):>30} "
             f"{difference:>30} {mo(1000)} {mo(60_000)}"
         )
+
+
+async def _breakout(args: argparse.Namespace) -> None:
+    from datetime import date, timedelta
+
+    from plom.breakout import backtest, history, study
+
+    until = date.fromisoformat(args.until) if args.until else date.today() - timedelta(1)
+    bars = history.load(args.coin, date.fromisoformat(args.since), until, args.cache)
+    result = study.run(args.coin.upper(), bars)
+    print(study.format_report(result, args.fee_bps), flush=True)
+    for year in _list(args.split_years):
+        print()
+        print(backtest.format_report(args.coin.upper(), backtest.walk_forward(bars, result.events, int(year), args.fee_bps), args.fee_bps))
 
 
 async def _leadlag(args: argparse.Namespace) -> None:

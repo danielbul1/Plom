@@ -16,6 +16,7 @@ Real liquidations from the venues that publish them are kept alongside, to check
 """
 
 import math
+from bisect import bisect_left, bisect_right, insort
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Literal
@@ -34,6 +35,10 @@ MAINTENANCE_MARGIN = 0.005
 ENTRY_BUCKET = 1e-4
 """Positions are merged by entry price in buckets of this fraction of the price (1bp)."""
 RECENT_LIQUIDATIONS = 2000
+_AFTER_ANY_KEY = ("\uffff",)
+"""Sorts after every cluster key, so a bisect can include levels equal to a price."""
+
+Key = tuple[str, str, int, int]
 
 
 @dataclass
@@ -45,14 +50,17 @@ class Cluster:
     leverage: int
     entry: float
     size: float
-    """Coins, as of `as_of_ms` (it decays with age)."""
+    """Coins as of `as_of_ms`, before the venue's later closes (see LiquidationModel.coins)."""
     as_of_ms: int
+    log_scale_at: float = 0.0
+    """The venue's cumulative log shrink when `size` was set."""
+    liquidation_price: float = field(init=False)
 
-    @property
-    def liquidation_price(self) -> float:
+    def __post_init__(self) -> None:
         if self.side == "long":
-            return self.entry * (1 - 1 / self.leverage + MAINTENANCE_MARGIN)
-        return self.entry * (1 + 1 / self.leverage - MAINTENANCE_MARGIN)
+            self.liquidation_price = self.entry * (1 - 1 / self.leverage + MAINTENANCE_MARGIN)
+        else:
+            self.liquidation_price = self.entry * (1 + 1 / self.leverage - MAINTENANCE_MARGIN)
 
     def decayed(self, now_ms: int) -> float:
         half_life_ms = LEVERAGE_TIERS[self.leverage][1] * 3_600_000
@@ -75,30 +83,49 @@ class _Flow:
         self.notional += price * size
 
 
+@dataclass(frozen=True)
+class Crossed:
+    """Estimated positions whose level a price move reached: they were (or are being) liquidated."""
+
+    side: Literal["long", "short"]
+    leverage: int
+    price: float
+    coins: float
+
+
 @dataclass
 class LiquidationModel:
-    clusters: dict[tuple[str, str, int, int], Cluster] = field(default_factory=dict)
+    clusters: dict[Key, Cluster] = field(default_factory=dict)
     last_oi: dict[str, float] = field(default_factory=dict)
     flows: dict[str, _Flow] = field(default_factory=dict)
     last_price: float | None = None
+    last_ms: int = 0
     liquidations: deque[Liquidation] = field(default_factory=lambda: deque(maxlen=RECENT_LIQUIDATIONS))
     opened: deque[tuple[int, str, float, float, float]] = field(default_factory=lambda: deque(maxlen=5000))
     """(time, venue, price, long coins, short coins) of every estimated opening, for position zones."""
     removed_by_price: float = 0.0
     """Coins of estimated positions removed because the price traded through their level."""
-    _highest_long: float = -math.inf
-    _lowest_short: float = math.inf
+    _log_scale: dict[str, float] = field(default_factory=dict)
+    """Per venue, the log of the share of positions still open after every close so far: closes
+    shrink all of a venue's positions at once, so they are applied lazily through this."""
+    _longs: list[tuple[float, Key]] = field(default_factory=list)
+    """Long clusters by liquidation price, ascending; shorts likewise."""
+    _shorts: list[tuple[float, Key]] = field(default_factory=list)
+
+    def coins(self, cluster: Cluster, now_ms: int) -> float:
+        """A cluster's estimated coins still open at now_ms, after decay and its venue's closes."""
+        return cluster.decayed(now_ms) * math.exp(self._log_scale.get(cluster.venue, 0.0) - cluster.log_scale_at)
 
     def on_trade(self, venue: str, side: str, price: float, size: float) -> None:
         if venue in self.last_oi:  # Flow only matters between a venue's open interest readings.
             self.flows.setdefault(venue, _Flow()).add(side, price, size)
         self.last_price = price
-        if price <= self._highest_long or price >= self._lowest_short:
-            self._remove_crossed(price)
+        self._remove_crossed_range(price, price)
 
     def on_open_interest(self, oi: OpenInterest) -> None:
         previous = self.last_oi.get(oi.venue)
         self.last_oi[oi.venue] = oi.coins
+        self.last_ms = max(self.last_ms, oi.time_ms)
         flow = self.flows.pop(oi.venue, _Flow())
         if previous is None:
             return  # The first reading only sets the baseline.
@@ -110,60 +137,62 @@ class LiquidationModel:
         if change > 0:
             buy_share = flow.buy / traded if traded else 0.5
             self._open(oi.venue, oi.time_ms, price, change * buy_share, change * (1 - buy_share))
-        else:
+        elif previous > 0 and oi.coins > 0:
             # Any open position is as likely to be the one closed, so all shrink by the share of
             # the venue's open interest that closed.
-            self._shrink(oi.venue, oi.time_ms, keep=oi.coins / previous)
+            self._log_scale[oi.venue] = self._log_scale.get(oi.venue, 0.0) + math.log(oi.coins / previous)
 
-    def on_interval(self, venue: str, time_ms: int, oi: float, buy: float, sell: float, low: float, high: float, price: float) -> None:
-        """Replay one historical interval: its range clears the levels it crossed, then its change in
-        open interest opens or closes positions at its typical price, split by its taker flow."""
-        self._remove_crossed_range(low, high)
+    def on_interval(self, venue: str, time_ms: int, oi: float, buy: float, sell: float, low: float, high: float, price: float) -> list[Crossed]:
+        """Replay one historical interval ending at time_ms: its range clears the levels it crossed
+        (which are returned), then its change in open interest opens or closes positions at its
+        typical price, split by its taker flow."""
+        crossed = self._remove_crossed_range(low, high, time_ms)
         self.last_price = price
         if venue in self.last_oi:
             self.flows[venue] = _Flow(buy, sell, (buy + sell) * price)
         self.on_open_interest(OpenInterest(venue, time_ms, oi))
+        return crossed
 
     def on_liquidation(self, liquidation: Liquidation) -> None:
         self.liquidations.append(liquidation)
 
+    def within(self, side: str, low: float, high: float) -> list[Cluster]:
+        """The clusters of one side whose liquidation price is in [low, high]."""
+        levels = self._longs if side == "long" else self._shorts
+        return [self.clusters[k] for _, k in levels[bisect_left(levels, (low,)):bisect_right(levels, (high, _AFTER_ANY_KEY))]]
+
     def _open(self, venue: str, now_ms: int, price: float, longs: float, shorts: float) -> None:
         self.opened.append((now_ms, venue, price, longs, shorts))
         bucket = round(math.log(price) / ENTRY_BUCKET)
+        log_scale = self._log_scale.get(venue, 0.0)
         for side, coins in (("long", longs), ("short", shorts)):
             for leverage, (share, _) in LEVERAGE_TIERS.items():
                 key = (venue, side, leverage, bucket)
                 cluster = self.clusters.get(key)
                 if cluster is None:
-                    cluster = self.clusters[key] = Cluster(venue, side, leverage, price, coins * share, now_ms)
+                    cluster = self.clusters[key] = Cluster(venue, side, leverage, price, coins * share, now_ms, log_scale)
+                    insort(self._longs if side == "long" else self._shorts, (cluster.liquidation_price, key))
                 else:
-                    cluster.size = cluster.decayed(now_ms) + coins * share
+                    cluster.size = self.coins(cluster, now_ms) + coins * share
                     cluster.as_of_ms = now_ms
-                if side == "long":
-                    self._highest_long = max(self._highest_long, cluster.liquidation_price)
-                else:
-                    self._lowest_short = min(self._lowest_short, cluster.liquidation_price)
+                    cluster.log_scale_at = log_scale
 
-    def _shrink(self, venue: str, now_ms: int, keep: float) -> None:
-        for c in self.clusters.values():
-            if c.venue == venue:
-                c.size = c.decayed(now_ms) * keep
-                c.as_of_ms = now_ms
-
-    def _remove_crossed(self, price: float) -> None:
-        self._remove_crossed_range(price, price)
-
-    def _remove_crossed_range(self, low: float, high: float) -> None:
-        crossed = [
-            key for key, c in self.clusters.items()
-            if (c.side == "long" and low <= c.liquidation_price) or (c.side == "short" and high >= c.liquidation_price)
-        ]
-        for key in crossed:
-            self.removed_by_price += self.clusters.pop(key).size
-        longs = [c.liquidation_price for c in self.clusters.values() if c.side == "long"]
-        shorts = [c.liquidation_price for c in self.clusters.values() if c.side == "short"]
-        self._highest_long = max(longs, default=-math.inf)
-        self._lowest_short = min(shorts, default=math.inf)
+    def _remove_crossed_range(self, low: float, high: float, now_ms: int | None = None) -> list[Crossed]:
+        now_ms = self.last_ms if now_ms is None else now_ms
+        cut_longs = bisect_left(self._longs, (low,))  # Longs at or above the low were reached.
+        cut_shorts = bisect_right(self._shorts, (high, _AFTER_ANY_KEY))  # Shorts at or below the high.
+        if cut_longs == len(self._longs) and cut_shorts == 0:
+            return []
+        keys = [k for _, k in self._longs[cut_longs:]] + [k for _, k in self._shorts[:cut_shorts]]
+        del self._longs[cut_longs:]
+        del self._shorts[:cut_shorts]
+        crossed = []
+        for key in keys:
+            cluster = self.clusters.pop(key)
+            coins = self.coins(cluster, now_ms)
+            self.removed_by_price += coins
+            crossed.append(Crossed(cluster.side, cluster.leverage, cluster.liquidation_price, coins))
+        return crossed
 
     def levels(self, now_ms: int, bucket_pct: float = 0.1, min_notional: float = 0.0) -> dict:
         """Estimated liquidation notional per price bucket, for longs (below the price) and shorts (above)."""
@@ -171,7 +200,7 @@ class LiquidationModel:
         sides: dict[str, dict[float, float]] = {"long": {}, "short": {}}
         by_leverage: dict[str, dict[int, float]] = {"long": {}, "short": {}}
         for c in self.clusters.values():
-            coins = c.decayed(now_ms)
+            coins = self.coins(c, now_ms)
             price = c.liquidation_price
             notional = coins * price
             key = round(math.floor(price / width) * width, 10)

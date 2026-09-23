@@ -60,6 +60,16 @@ class Store:
                 " low REAL, close REAL, volume REAL, buy_volume REAL, sell_volume REAL, trade_count INTEGER,"
                 " source TEXT, partial INTEGER, PRIMARY KEY (symbol, interval, open_ms))"
             )
+            # Real liquidations and open interest, kept to check the liquidation model and strategies against.
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS liquidations (symbol TEXT, venue TEXT, ts_ms INTEGER, position TEXT,"
+                " price REAL, size REAL)"
+            )
+            self._db.execute("CREATE INDEX IF NOT EXISTS liquidations_time ON liquidations (symbol, ts_ms)")
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS open_interest (symbol TEXT, venue TEXT, ts_ms INTEGER, coins REAL,"
+                " PRIMARY KEY (symbol, venue, ts_ms))"
+            )
 
     def write_live(self, symbol: str, interval: str, candles: list[Candle]) -> None:
         with self._lock, self._db:
@@ -88,6 +98,36 @@ class Store:
                 (symbol, interval, INTERVALS[interval], now_ms),
             ).fetchall()
         return [row[0] for row in rows]
+
+    def write_positioning(self, symbol: str, liquidations: list, open_interest: list) -> None:
+        """Liquidations and open interest readings (positioning.Liquidation and OpenInterest)."""
+        with self._lock, self._db:
+            self._db.executemany(
+                "INSERT INTO liquidations VALUES (?, ?, ?, ?, ?, ?)",
+                [(symbol, l.venue, l.time_ms, l.position, l.price, l.size) for l in liquidations],
+            )
+            self._db.executemany(
+                "INSERT OR REPLACE INTO open_interest VALUES (?, ?, ?, ?)",
+                [(symbol, o.venue, o.time_ms, o.coins) for o in open_interest],
+            )
+
+    def read_liquidations(self, symbol: str, from_ms: int, to_ms: int) -> list[tuple[str, int, str, float, float]]:
+        """(venue, time, position, price, coins), oldest first."""
+        with self._lock:
+            return self._db.execute(
+                "SELECT venue, ts_ms, position, price, size FROM liquidations WHERE symbol = ? AND ts_ms >= ?"
+                " AND ts_ms <= ? ORDER BY ts_ms",
+                (symbol, from_ms, to_ms),
+            ).fetchall()
+
+    def read_open_interest(self, symbol: str, from_ms: int, to_ms: int) -> list[tuple[str, int, float]]:
+        """(venue, time, coins), oldest first."""
+        with self._lock:
+            return self._db.execute(
+                "SELECT venue, ts_ms, coins FROM open_interest WHERE symbol = ? AND ts_ms >= ? AND ts_ms <= ?"
+                " ORDER BY ts_ms",
+                (symbol, from_ms, to_ms),
+            ).fetchall()
 
     def read(self, symbol: str, interval: str, from_ms: int, to_ms: int) -> list[Candle]:
         with self._lock:

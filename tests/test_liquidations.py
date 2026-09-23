@@ -16,8 +16,8 @@ def opened_model():
 
 def test_rising_open_interest_opens_positions_split_by_taker_flow():
     model = opened_model()
-    longs = sum(c.size for c in model.clusters.values() if c.side == "long")
-    shorts = sum(c.size for c in model.clusters.values() if c.side == "short")
+    longs = sum(model.coins(c, 1000) for c in model.clusters.values() if c.side == "long")
+    shorts = sum(model.coins(c, 1000) for c in model.clusters.values() if c.side == "short")
     assert longs == pytest.approx(7.5) and shorts == pytest.approx(2.5)
     ten_x_long = next(c for c in model.clusters.values() if c.side == "long" and c.leverage == 10)
     assert ten_x_long.liquidation_price == pytest.approx(100 * (1 - 0.1 + MAINTENANCE_MARGIN))
@@ -27,7 +27,7 @@ def test_rising_open_interest_opens_positions_split_by_taker_flow():
 def test_falling_open_interest_shrinks_that_venues_positions():
     model = opened_model()
     model.on_open_interest(OpenInterest("okx", 2000, 99.0))  # A tenth of all open interest closed.
-    assert sum(c.size for c in model.clusters.values()) == pytest.approx(9.0, rel=1e-3)
+    assert sum(model.coins(c, 2000) for c in model.clusters.values()) == pytest.approx(9.0, rel=1e-3)
 
 
 def test_trading_through_a_level_removes_it():

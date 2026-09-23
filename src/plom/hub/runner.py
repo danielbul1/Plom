@@ -35,6 +35,9 @@ class Hub:
         self._tasks: list[asyncio.Task] = []
         self._seeded: set[str] = set()
         self._seed_lock = asyncio.Lock()
+        self._pending_liquidations: dict[str, list[positioning.Liquidation]] = {s: [] for s in self.states}
+        self._pending_oi: dict[str, list[positioning.OpenInterest]] = {s: [] for s in self.states}
+        self._last_oi_minute: dict[tuple[str, str], int] = {}
 
     def start(self) -> None:
         for symbol in self.states:
@@ -77,6 +80,10 @@ class Hub:
             await asyncio.sleep(CANDLE_FLUSH_S)
             for symbol, state in self.states.items():
                 state.candles.flush(symbol, self.store)
+                liquidations, readings = self._pending_liquidations[symbol], self._pending_oi[symbol]
+                if liquidations or readings:
+                    self._pending_liquidations[symbol], self._pending_oi[symbol] = [], []
+                    self.store.write_positioning(symbol, liquidations, readings)
 
     async def _initial_backfill(self) -> None:
         """Give charts some history from the start: fill each window's gaps once."""
@@ -124,6 +131,14 @@ class Hub:
         self._seeded.add(symbol)
         log.info("seeded %s liquidation model from %d OKX intervals", symbol, len(rows))
 
+    def _keep_open_interest(self, symbol: str, reading: positioning.OpenInterest) -> None:
+        """Store at most one reading per venue a minute: some venues publish every few seconds."""
+        minute = reading.time_ms // 60_000
+        if self.store is None or self._last_oi_minute.get((symbol, reading.venue)) == minute:
+            return
+        self._last_oi_minute[(symbol, reading.venue)] = minute
+        self._pending_oi[symbol].append(reading)
+
     async def _positioning(self, symbol: str, venue: str, kind: str) -> None:
         """Feed a venue's open interest or liquidations into the symbol's liquidation model, forever."""
         coin, model, key = coin_of(symbol), self.states[symbol].liquidations, (symbol, f"{venue} {kind}")
@@ -138,6 +153,7 @@ class Hub:
                     async for message in stream(coin):
                         for reading in parse(message):
                             model.on_open_interest(reading)
+                            self._keep_open_interest(symbol, reading)
                         self.status[key] = "live"
                         backoff = 1.0
                 else:
@@ -146,6 +162,8 @@ class Hub:
                     async for message in stream(coin):
                         for liquidation in parse(message, coin, contract):
                             model.on_liquidation(liquidation)
+                            if self.store is not None:
+                                self._pending_liquidations[symbol].append(liquidation)
                         self.status[key] = "live"
                         backoff = 1.0
             except asyncio.CancelledError:

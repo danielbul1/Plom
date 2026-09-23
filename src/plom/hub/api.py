@@ -120,6 +120,21 @@ def create_app(hub: Hub, token: str | None, start_hub: bool = True, recordings: 
         recent = list(state(symbol).liquidations.liquidations)[-limit:]
         return {"symbol": symbol.upper(), "liquidations": [l.to_json() for l in recent]}
 
+    @app.get("/api/v1/premium/positioning_history", dependencies=[Depends(auth)])
+    def positioning_history(symbol: str, from_ms: int, to_ms: int | None = None) -> dict:
+        """Stored real liquidations and open interest (a reading per venue a minute), oldest first."""
+        if hub.store is None:
+            raise HTTPException(503, "no store configured")
+        s, to_ms = state(symbol), to_ms or round(now_ms())
+        return {
+            "symbol": s.symbol,
+            "liquidations": [
+                {"venue": v, "ts_ms": t, "position": p, "price": price, "size": size}
+                for v, t, p, price, size in hub.store.read_liquidations(s.symbol, from_ms, to_ms)
+            ],
+            "open_interest": [{"venue": v, "ts_ms": t, "coins": c} for v, t, c in hub.store.read_open_interest(s.symbol, from_ms, to_ms)],
+        }
+
     @app.get("/api/v1/market/tape", dependencies=[Depends(auth)])
     def tape(symbol: str, after_seq: int = 0, limit: int = Query(200, ge=1, le=5000)) -> dict:
         prints = state(symbol).prints_after(after_seq, limit)
