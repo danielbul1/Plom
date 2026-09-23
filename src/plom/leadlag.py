@@ -17,6 +17,10 @@ from plom.venues import VENUES
 GRID_MS = 25
 LAGS_MS = range(-1000, 2001, 25)
 HORIZONS_MS = (250, 500, 1000, 2000, 5000)
+MOVE_WINDOW_MS = 250
+MOVE_GAP_MS = 2000
+"""Sharp moves closer together than this count as one."""
+AFTER_MS = (0, 100, 250, 500, 1000, 2000, 3000)
 BASIS_HALF_LIFE_S = 300.0
 
 
@@ -32,6 +36,21 @@ class LeadLag:
     """Per horizon: (beta, r2) of the venue's future mid move on today's basis-adjusted gap to the reference."""
     gap_bps_p50: float
     gap_bps_p90: float
+    moves: "Moves | None" = None
+
+
+@dataclass(frozen=True)
+class Moves:
+    """How the venue followed the reference's sharp moves, signed so the reference moved up."""
+
+    threshold_bps: float
+    count: int
+    reference_bps: float
+    """Mean size of the reference's move over MOVE_WINDOW_MS."""
+    venue_bps: dict[int, float]
+    """Per ms after the move: how far the venue had moved since it began."""
+    gap_bps: dict[int, float]
+    """Per ms after the move: the basis-adjusted gap still open (positive: the venue lags)."""
 
 
 def mid_series(path: Path, venues: Sequence[str], grid_ms: int = GRID_MS) -> tuple[np.ndarray, dict[str, np.ndarray]]:
@@ -72,15 +91,35 @@ def mid_series(path: Path, venues: Sequence[str], grid_ms: int = GRID_MS) -> tup
     return grid, sampled
 
 
-def measure(path: Path, reference: str, venues: Sequence[str]) -> list[LeadLag]:
+def measure(path: Path, reference: str, venues: Sequence[str], move_bps: float = 1.5) -> list[LeadLag]:
     if reference == composite.NAME:
         # Measure each venue against a composite without it, reading the recording once per venue.
-        return [_measure(venue, *mid_series(path, [reference, venue]), reference) for venue in venues]
+        return [_measure(venue, *mid_series(path, [reference, venue]), reference, move_bps) for venue in venues]
     grid, log_mids = mid_series(path, [reference, *venues])
-    return [_measure(venue, grid, log_mids, reference) for venue in venues]
+    return [_measure(venue, grid, log_mids, reference, move_bps) for venue in venues]
 
 
-def _measure(venue: str, grid: np.ndarray, log_mids: dict[str, np.ndarray], reference: str) -> LeadLag:
+def sharp_moves(ref: np.ndarray, mid: np.ndarray, basis: np.ndarray, threshold_bps: float, warmup: int) -> Moves | None:
+    """Follow the venue after each move of the reference of at least threshold_bps within MOVE_WINDOW_MS."""
+    steps, gap_steps, last = MOVE_WINDOW_MS // GRID_MS, MOVE_GAP_MS // GRID_MS, max(AFTER_MS) // GRID_MS
+    move = (ref[steps:] - ref[:-steps]) * 10_000
+    events: list[int] = []
+    for i in np.flatnonzero(np.abs(move) >= threshold_bps):
+        if i >= warmup and i + steps + last < len(ref) and (not events or i - events[-1] >= gap_steps):
+            events.append(int(i))
+    if not events:
+        return None
+    start = np.array(events)
+    sign = np.sign(move[start])
+    venue_bps, gap_bps = {}, {}
+    for after in AFTER_MS:
+        t = start + steps + after // GRID_MS
+        venue_bps[after] = float(np.mean((mid[t] - mid[start]) * sign) * 10_000)
+        gap_bps[after] = float(np.mean((ref[t] + basis[start] - mid[t]) * sign) * 10_000)
+    return Moves(threshold_bps, len(events), float(np.mean(np.abs(move[start]))), venue_bps, gap_bps)
+
+
+def _measure(venue: str, grid: np.ndarray, log_mids: dict[str, np.ndarray], reference: str, move_bps: float = 1.5) -> LeadLag:
     ref = log_mids[reference]
     ref_returns = np.diff(ref)
     alpha = 1 - 0.5 ** (GRID_MS / 1000 / BASIS_HALF_LIFE_S)
@@ -107,6 +146,7 @@ def _measure(venue: str, grid: np.ndarray, log_mids: dict[str, np.ndarray], refe
         catch_up=catch_up,
         gap_bps_p50=float(np.percentile(gap_bps, 50)) if gap_bps.size else 0.0,
         gap_bps_p90=float(np.percentile(gap_bps, 90)) if gap_bps.size else 0.0,
+        moves=sharp_moves(ref, mid, basis, move_bps, warmup),
     )
 
 
@@ -126,6 +166,16 @@ def format_report(reference: str, results: Sequence[LeadLag]) -> str:
         ]
         for horizon, (beta, r2) in r.catch_up.items():
             lines.append(f"  {horizon:>5}ms  beta {beta:+.2f}  r2 {r2:.3f}")
+        m = r.moves
+        if m is None:
+            lines.append(f"sharp moves: none of {reference} reached the threshold")
+            continue
+        lines.append(
+            f"after {m.count} sharp {reference} moves (>= {m.threshold_bps:g}bps within {MOVE_WINDOW_MS}ms, "
+            f"mean {m.reference_bps:.2f}bps), {r.venue} had moved / still lagged by:"
+        )
+        for after in AFTER_MS:
+            lines.append(f"  +{after:>4}ms  moved {m.venue_bps[after]:+.2f}bps  gap {m.gap_bps[after]:+.2f}bps")
     return "\n".join(lines)
 
 

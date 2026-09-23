@@ -82,3 +82,19 @@ def test_router_feeds_the_composite_without_the_quoting_venue(tmp_path):
     assert routed[0] == [] and routed[1][0][0] is False
     [(is_reference, recv_ms, book)] = routed[2]
     assert is_reference and recv_ms == 10.0 and price(book) == pytest.approx(math.sqrt(100 * 99.5))
+
+
+def test_sharp_moves_track_how_a_lagging_venue_catches_up():
+    import numpy as np
+
+    from plom import leadlag
+
+    steps = 400
+    ref = np.zeros(steps)
+    ref[100:] = 2e-4  # The reference jumps 2bps at step 100...
+    mid = np.zeros(steps)
+    mid[100 + 500 // leadlag.GRID_MS:] = 2e-4  # ...and the venue follows 500ms later.
+    moves = leadlag.sharp_moves(ref, mid, np.zeros(steps), threshold_bps=1.5, warmup=0)
+    assert moves.count == 1 and moves.reference_bps == pytest.approx(2.0)
+    assert moves.gap_bps[0] == pytest.approx(2.0) and moves.venue_bps[0] == 0
+    assert moves.gap_bps[500] == pytest.approx(0.0) and moves.venue_bps[1000] == pytest.approx(2.0)

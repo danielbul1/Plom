@@ -78,7 +78,8 @@ def main() -> None:
     ll = commands.add_parser("leadlag", help="how far each venue's mid lags a reference, and how well the gap predicts catch-up")
     ll.add_argument("replay", type=Path)
     ll.add_argument("--reference", choices=[*VENUES, composite.NAME], default=composite.NAME)
-    ll.add_argument("--venues", default="hyperliquid,lighter,orderly")
+    ll.add_argument("--venues", default="hyperliquid,lighter,orderly,bitunix")
+    ll.add_argument("--move-bps", type=float, default=1.5, help="a reference move this big within 250ms counts as sharp")
 
     sv = commands.add_parser("serve", help="aggregate live data from every venue and serve it over REST and WebSocket")
     sv.add_argument("--coins", default=os.environ.get("PLOM_COINS", ",".join(SERVE_COINS)))
@@ -191,7 +192,7 @@ async def _leadlag(args: argparse.Namespace) -> None:
     from plom import leadlag
 
     venues = [v for v in args.venues.split(",") if v != args.reference]
-    print(leadlag.format_report(args.reference, leadlag.measure(args.replay, args.reference, venues)))
+    print(leadlag.format_report(args.reference, leadlag.measure(args.replay, args.reference, venues, args.move_bps)))
 
 
 async def _serve(args: argparse.Namespace) -> None:
