@@ -141,6 +141,10 @@ The dashboard at `/` shows it all live for BTC and ETH: candles with volume colo
 
 The token comes from `PLOM_TOKEN`; without it the API is open. `PLOM_COINS`, `PLOM_VENUES` and `PORT` set the defaults for `--coins`, `--venues` and `--port`.
 
+## Running on a server
+
+The `Dockerfile` runs `scripts/railway-start.sh`: an hourly recording of each coin in `PLOM_RECORD_COINS` (default BTC and ETH) from `PLOM_RECORD_VENUES` into `$PLOM_DATA/recordings`, deleting files older than `PLOM_KEEP_DAYS` (default 3), with the hub in front on `$PORT`. `railway.json` builds it on Railway with a health check on `/api/v1/health`; mount a volume at `/data` and set `PLOM_TOKEN`. Only list venues the server's region can reach: one that refuses the connection stops the whole recording it is in.
+
 ## Tests
 
 ```bash
