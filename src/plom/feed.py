@@ -23,6 +23,9 @@ class Source:
     """The reply to a server keep-alive message, which is then not passed on."""
     keep: Callable[[dict], bool] = lambda message: True
     """Whether to pass a message on, e.g. to drop subscription acknowledgements."""
+    heartbeat: Callable[[], dict] | None = None
+    """A keep-alive message some venues need from us, sent every heartbeat_s."""
+    heartbeat_s: float = 20.0
     sync: Callable[[], Callable[[dict], bool]] | None = None
     """Makes a fresh check per connection that returns False when a message shows a gap in a
     delta stream; we then reconnect, which brings a new snapshot."""
@@ -48,6 +51,7 @@ async def merged(sources: Sequence[Source]) -> AsyncIterator[dict]:
 
 async def _pump(source: Source, queue: asyncio.Queue[dict]) -> None:
     async for ws in websockets.connect(source.url, max_size=None):
+        beat = asyncio.create_task(_heartbeat(ws, source)) if source.heartbeat else None
         try:
             for message in source.subscribe:
                 await ws.send(json.dumps(message))
@@ -72,6 +76,15 @@ async def _pump(source: Source, queue: asyncio.Queue[dict]) -> None:
                 queue.put_nowait(message)
         except websockets.ConnectionClosed:
             continue
+        finally:
+            if beat is not None:
+                beat.cancel()
+
+
+async def _heartbeat(ws: websockets.ClientConnection, source: Source) -> None:
+    while True:
+        await asyncio.sleep(source.heartbeat_s)
+        await ws.send(json.dumps(source.heartbeat()))
 
 
 def chained(sequence: Callable[[dict], tuple[bool, int, int] | None]) -> Callable[[], Callable[[dict], bool]]:

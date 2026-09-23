@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from plom import aster, binance, blofin, coinbase, feed, htx, hyperliquid, lighter, okx, orderly, recording
+from plom import aster, binance, bitunix, blofin, coinbase, feed, htx, hyperliquid, lighter, okx, orderly, recording
 from plom.market import Book, LocalBook, Trade
 
 
@@ -251,3 +251,12 @@ def test_htx_lays_a_fresher_bbo_over_the_depth_snapshot():
 def test_aster_depth_snapshot():
     message = {"data": {"e": "depthUpdate", "T": 9, "b": [["100", "1"], ["99", "2"]], "a": [["101", "3"]]}}
     assert aster.Parser().events(message) == [Book(9, [(100.0, 1.0), (99.0, 2.0)], [(101.0, 3.0)])]
+
+
+# Bitunix ---------------------------------------------------------------------------------------
+
+def test_bitunix_books_and_trades_use_the_message_time():
+    book = {"ch": "depth_book15", "ts": 9, "data": {"b": [["100", "1"], ["99", "2"]], "a": [["101", "3"]]}}
+    assert bitunix.Parser().events(book) == [Book(9, [(100.0, 1.0), (99.0, 2.0)], [(101.0, 3.0)])]
+    trade = {"ch": "trade", "ts": 11, "data": [{"t": "2026-09-23T11:01:43Z", "p": "100.5", "v": "0.2", "s": "sell"}]}
+    assert bitunix.Parser().events(trade) == [Trade(11, "sell", 100.5, 0.2)]

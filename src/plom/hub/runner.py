@@ -14,7 +14,7 @@ log = logging.getLogger("plom.hub")
 MAX_BACKOFF_S = 60.0
 BOOK_LEVELS = 200
 """Levels per side kept from venues whose books we rebuild ourselves."""
-DEPTH_STREAMS = {"okx", "blofin", "htx_spot", "htx_perps", "aster"}
+DEPTH_STREAMS = {"okx", "blofin", "htx_spot", "htx_perps", "aster", "bitunix"}
 """Venues that stream only the top of book unless asked for depth."""
 DEEP_PARSERS = {"okx", "blofin", "coinbase", "orderly"}
 CANDLE_FLUSH_S = 5.0

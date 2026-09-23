@@ -19,8 +19,8 @@ from plom.venues import VENUES
 
 BAR_WIDTH = 20
 SERVE_COINS = ("BTC", "ETH")
-SERVE_VENUES = tuple(dict.fromkeys(("hyperliquid", "orderly", *composite.VENUES)))
-RECORD_VENUES = dict.fromkeys(("hyperliquid", "lighter", "orderly", *composite.VENUES))
+SERVE_VENUES = tuple(dict.fromkeys(("hyperliquid", "orderly", *composite.VENUES, "bitunix")))
+RECORD_VENUES = dict.fromkeys(("hyperliquid", "lighter", "orderly", *composite.VENUES, "bitunix"))
 
 
 def main() -> None:
