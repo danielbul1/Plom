@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator
 from datetime import datetime
 
 from plom import feed
-from plom.market import Book, LocalBook, Trade
+from plom.market import BOOK_DEPTH, Book, LocalBook, Trade
 
 NAME = "coinbase"
 WS_URL = "wss://ws-feed.exchange.coinbase.com"
@@ -23,8 +23,8 @@ def messages(coin: str) -> AsyncIterator[dict]:
 
 
 class Parser:
-    def __init__(self) -> None:
-        self._book = LocalBook()
+    def __init__(self, depth: int = BOOK_DEPTH) -> None:
+        self._book = LocalBook(depth)
         self._synced = False
 
     def events(self, message: dict) -> list[Book | Trade]:

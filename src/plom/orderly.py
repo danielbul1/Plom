@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator
 
 import websockets
 
-from plom.market import Book, Level, LocalBook, Trade
+from plom.market import BOOK_DEPTH, Book, Level, LocalBook, Trade
 
 NAME = "orderly"
 PUBLIC_WS_KEY = "OqdphuyCtYWxwzhxyLLjOWNdFP7sQt8RPWzmb5xY"
@@ -60,8 +60,8 @@ async def messages(coin: str) -> AsyncIterator[dict]:
 
 
 class Parser:
-    def __init__(self) -> None:
-        self._book = LocalBook()
+    def __init__(self, depth: int = BOOK_DEPTH) -> None:
+        self._book = LocalBook(depth)
         self._ts: int | None = None
 
     def events(self, message: dict) -> list[Book | Trade]:

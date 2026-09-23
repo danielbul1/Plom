@@ -34,6 +34,10 @@ class Parser:
                 bids = [(float(data["b"]), float(data["B"]))]
                 asks = [(float(data["a"]), float(data["A"]))]
                 return [Book(data["T"], bids, asks)]
+            case "depthUpdate":  # A partial-depth snapshot, as Aster sends.
+                bids = [(float(p), float(q)) for p, q in data["b"]]
+                asks = [(float(p), float(q)) for p, q in data["a"]]
+                return [Book(data["T"], bids, asks)] if bids and asks else []
             case "aggTrade":
                 # m: the buyer was the maker, so the aggressor sold.
                 side = "sell" if data["m"] else "buy"

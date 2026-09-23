@@ -23,6 +23,9 @@ class Source:
     """The reply to a server keep-alive message, which is then not passed on."""
     keep: Callable[[dict], bool] = lambda message: True
     """Whether to pass a message on, e.g. to drop subscription acknowledgements."""
+    sync: Callable[[], Callable[[dict], bool]] | None = None
+    """Makes a fresh check per connection that returns False when a message shows a gap in a
+    delta stream; we then reconnect, which brings a new snapshot."""
 
 
 async def merged(sources: Sequence[Source]) -> AsyncIterator[dict]:
@@ -49,6 +52,7 @@ async def _pump(source: Source, queue: asyncio.Queue[dict]) -> None:
             for message in source.subscribe:
                 await ws.send(json.dumps(message))
             last_ms = 0.0
+            in_sync = source.sync() if source.sync else None
             async for raw in ws:
                 message = source.decode(raw)
                 reply = source.pong(message)
@@ -57,6 +61,9 @@ async def _pump(source: Source, queue: asyncio.Queue[dict]) -> None:
                     continue
                 if not source.keep(message):
                     continue
+                if in_sync is not None and not in_sync(message):
+                    await ws.close()
+                    break
                 if source.throttle_ms and source.is_book(message):
                     now_ms = time.monotonic() * 1000
                     if now_ms - last_ms < source.throttle_ms:
@@ -65,3 +72,28 @@ async def _pump(source: Source, queue: asyncio.Queue[dict]) -> None:
                 queue.put_nowait(message)
         except websockets.ConnectionClosed:
             continue
+
+
+def chained(sequence: Callable[[dict], tuple[bool, int, int] | None]) -> Callable[[], Callable[[dict], bool]]:
+    """A sync check for delta streams where each update names the sequence number of the one before.
+
+    `sequence` returns (is_snapshot, previous, current) for book messages and None for the rest.
+    """
+
+    def make() -> Callable[[dict], bool]:
+        last: int | None = None
+
+        def in_sync(message: dict) -> bool:
+            nonlocal last
+            found = sequence(message)
+            if found is None:
+                return True
+            is_snapshot, previous, current = found
+            if not is_snapshot and previous != last:
+                return False
+            last = current
+            return True
+
+        return in_sync
+
+    return make

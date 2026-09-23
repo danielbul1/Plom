@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from plom import aster, binance, blofin, coinbase, htx, hyperliquid, lighter, okx, orderly, recording
+from plom import aster, binance, blofin, coinbase, feed, htx, hyperliquid, lighter, okx, orderly, recording
 from plom.market import Book, LocalBook, Trade
 
 
@@ -198,3 +198,56 @@ def test_blofin_books5_and_trades():
 def test_aster_parses_like_binance():
     message = {"stream": "btcusdt@bookTicker", "data": {"e": "bookTicker", "b": "100.1", "B": "2", "a": "100.2", "A": "3", "T": 9}}
     assert aster.Parser().events(message) == [Book(9, [(100.1, 2.0)], [(100.2, 3.0)])]
+
+
+# Depth -----------------------------------------------------------------------------------------
+
+def okx_books(action, seq, prev, bids=(), asks=(), ts="5"):
+    rows = lambda levels: [[str(p), str(s), "0", "1"] for p, s in levels]
+    return {"arg": {"channel": "books"}, "action": action, "data": [{"bids": rows(bids), "asks": rows(asks), "ts": ts, "seqId": seq, "prevSeqId": prev}]}
+
+
+def test_okx_books_apply_chained_deltas_and_drop_after_a_gap():
+    parser = okx.Parser(depth=2)
+    [book] = parser.events(okx_books("snapshot", 10, -1, [(100, 1), (99, 1), (98, 1)], [(101, 1)]))
+    assert book.bids == [(100.0, 1.0), (99.0, 1.0)]  # Truncated to the parser's depth.
+    [book] = parser.events(okx_books("update", 11, 10, [(100, 0)], [(101, 5)]))
+    assert book.bids[0] == (99.0, 1.0) and book.asks == [(101.0, 5.0)]
+    assert parser.events(okx_books("update", 13, 12, [(97, 1)])) == []
+    assert parser.events(okx_books("update", 14, 13, [(96, 1)])) == []  # Still out of sync.
+    [book] = parser.events(okx_books("snapshot", 20, -1, [(90, 1)], [(91, 1)]))
+    assert book.bids == [(90.0, 1.0)]
+
+
+def test_chained_sync_check_flags_a_gap():
+    in_sync = feed.chained(okx._sequence)()
+    assert in_sync({"arg": {"channel": "trades"}, "data": []})
+    assert in_sync(okx_books("snapshot", 10, -1))
+    assert in_sync(okx_books("update", 11, 10))
+    assert not in_sync(okx_books("update", 13, 12))
+
+
+def test_blofin_books_snapshot_then_delta():
+    parser = blofin.Parser()
+    snapshot = {"arg": {"channel": "books"}, "action": "snapshot", "data": {"bids": [["100", "1"]], "asks": [["101", "2"]], "ts": "5", "prevSeqId": "0", "seqId": "7"}}
+    update = {"arg": {"channel": "books"}, "action": "update", "data": {"bids": [["100.5", "3"]], "asks": [], "ts": "6", "prevSeqId": "7", "seqId": "8"}}
+    parser.events(snapshot)
+    [book] = parser.events(update)
+    assert book == Book(6, [(100.5, 3.0), (100.0, 1.0)], [(101.0, 2.0)])
+
+
+def test_htx_lays_a_fresher_bbo_over_the_depth_snapshot():
+    parser = htx.Perps.Parser()
+    depth = {"ch": "market.BTC-USDT.depth.step0", "tick": {"bids": [[100.0, 5], [99.0, 5]], "asks": [[101.0, 5], [102.0, 5]], "ts": 10}}
+    [book] = parser.events(depth)
+    assert len(book.bids) == 2
+    bbo = {"ch": "market.BTC-USDT.bbo", "tick": {"bid": [100.5, 1], "ask": [101.5, 2], "ts": 20}}
+    [book] = parser.events(bbo)
+    assert book == Book(20, [(100.5, 1), (100.0, 5), (99.0, 5)], [(101.5, 2), (102.0, 5)])
+    [book] = parser.events({**depth, "tick": {**depth["tick"], "ts": 30}})
+    assert book.bids[0] == (100.0, 5)  # A newer snapshot wins.
+
+
+def test_aster_depth_snapshot():
+    message = {"data": {"e": "depthUpdate", "T": 9, "b": [["100", "1"], ["99", "2"]], "a": [["101", "3"]]}}
+    assert aster.Parser().events(message) == [Book(9, [(100.0, 1.0), (99.0, 2.0)], [(101.0, 3.0)])]

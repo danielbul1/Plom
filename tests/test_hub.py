@@ -118,3 +118,26 @@ def test_websocket_streams_subscribed_symbols(client):
         assert ws.receive_json() == {"event": "subscribed", "symbols": ["BTC-USD"]}
         events = {ws.receive_json()["event"] for _ in range(3)}
         assert {"tick", "dom"} <= events
+
+
+def test_heatmap_columns_put_bids_and_asks_on_one_grid_around_the_price():
+    state = SymbolState("BTC-USD", VENUES)
+    now = 1_000_000.0
+    state.on_book("coinbase", now, Book(0, [(100.0, 1.0), (99.8, 2.0)], [(100.2, 3.0)]))
+    state.on_book("okx", now, Book(0, [(100.0, 1.0)], [(100.2, 1.0), (100.5, 4.0)]))
+    state.on_book("aster", now, Book(0, [(100.0, 1.0)], [(100.2, 1.0)]))
+    column = state.sample_heatmap(now)
+    assert column.bucket == 0.01 and column.price == pytest.approx(100.1)
+    index = lambda price: round((price - column.low) / column.bucket)
+    assert column.bids[index(100.0)] == pytest.approx(3.0) and column.bids[index(99.8)] == pytest.approx(2.0)
+    assert column.asks[index(100.2)] == pytest.approx(5.0) and column.asks[index(100.5)] == pytest.approx(4.0)
+    assert column.bids[index(100.2)] == 0 and column.asks[index(100.0)] == 0
+    for t in range(1, 5):
+        state.sample_heatmap(now + t * 1000)
+    assert [c.ts_ms for c in state.heatmap_since(now + 4000, 2.5)] == [now + 2000, now + 3000, now + 4000]
+    assert [c.ts_ms for c in state.heatmap_since(now + 4000, 10, step=2)] == [now, now + 2000, now + 4000]
+
+
+def test_api_heatmap(client):
+    response = client.get("/api/v1/market/heatmap?symbol=BTC-USD&token=secret").json()
+    assert response["columns"] == [] and response["levels"] > 0

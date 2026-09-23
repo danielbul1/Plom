@@ -1,5 +1,6 @@
 """Venue-neutral market data: books, trades, and a local book maintained from deltas."""
 
+import heapq
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
@@ -37,7 +38,8 @@ class Parser(Protocol):
 class LocalBook:
     """A full order book rebuilt from a snapshot plus deltas, where size 0 deletes a level."""
 
-    def __init__(self) -> None:
+    def __init__(self, depth: int = BOOK_DEPTH) -> None:
+        self.depth = depth
         self.bids: dict[float, float] = {}
         self.asks: dict[float, float] = {}
 
@@ -53,7 +55,8 @@ class LocalBook:
                 else:
                     side.pop(price, None)
 
-    def book(self, time_ms: int, depth: int = BOOK_DEPTH) -> Book:
-        bids = sorted(self.bids.items(), reverse=True)[:depth]
-        asks = sorted(self.asks.items())[:depth]
+    def book(self, time_ms: int, depth: int | None = None) -> Book:
+        depth = depth or self.depth
+        bids = heapq.nlargest(depth, self.bids.items())
+        asks = heapq.nsmallest(depth, self.asks.items())
         return Book(time_ms, bids, asks)

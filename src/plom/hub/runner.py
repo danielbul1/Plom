@@ -12,6 +12,11 @@ from plom.venues import VENUES
 
 log = logging.getLogger("plom.hub")
 MAX_BACKOFF_S = 60.0
+BOOK_LEVELS = 200
+"""Levels per side kept from venues whose books we rebuild ourselves."""
+DEPTH_STREAMS = {"okx", "blofin", "htx_spot", "htx_perps", "aster"}
+"""Venues that stream only the top of book unless asked for depth."""
+DEEP_PARSERS = {"okx", "blofin", "coinbase", "orderly"}
 
 
 class Hub:
@@ -26,6 +31,15 @@ class Hub:
         for symbol in self.states:
             for venue in self.venues:
                 self._tasks.append(asyncio.create_task(self._run(symbol, venue)))
+        self._tasks.append(asyncio.create_task(self._sample()))
+
+    async def _sample(self) -> None:
+        """Take a heatmap column for every symbol at the top of each second."""
+        while True:
+            await asyncio.sleep(1 - time.time() % 1)
+            now_ms = time.time() * 1000
+            for state in self.states.values():
+                state.sample_heatmap(now_ms)
 
     async def stop(self) -> None:
         for task in self._tasks:
@@ -44,8 +58,10 @@ class Hub:
                     return
                 book_scale = size if venue in contracts.BOOK_IN_CONTRACTS else 1.0
                 trade_scale = size if venue in contracts.TRADES_IN_CONTRACTS else 1.0
-                parser = VENUES[venue].Parser()
-                async for message in VENUES[venue].messages(coin):
+                module = VENUES[venue]
+                parser = module.Parser(depth=BOOK_LEVELS) if venue in DEEP_PARSERS else module.Parser()
+                stream = module.messages(coin, depth=True) if venue in DEPTH_STREAMS else module.messages(coin)
+                async for message in stream:
                     recv_ms = time.time() * 1000
                     for event in parser.events(message):
                         if isinstance(event, Book):

@@ -119,7 +119,7 @@ Caveats: our orders never move the real market, queue position is estimated from
 
 ## Hub
 
-`plom serve` streams every venue for several coins at once and serves the aggregate over REST and WebSocket, like the aggregator APIs sold to traders, but from our own direct feeds (tens to hundreds of milliseconds old rather than seconds).
+`plom serve` streams every venue's full book (up to 200 levels a side; OKX, BloFin, HTX and Aster switch from top of book to their depth channels, and delta streams reconnect for a new snapshot on a sequence gap) for several coins at once and serves the aggregate over REST and WebSocket, like the aggregator APIs sold to traders, but from our own direct feeds (tens to hundreds of milliseconds old rather than seconds).
 
 ```bash
 PLOM_TOKEN=... uv run plom serve --coins BTC,ETH,SOL --port 8000
@@ -128,9 +128,10 @@ curl -H "Authorization: Bearer $PLOM_TOKEN" "localhost:8000/api/v1/market/tick?s
 
 - `GET /api/v1/market/tick`: the composite price, each fresh venue's mid, spread, age and learned basis, and volume over the last second.
 - `GET /api/v1/market/dom`: every venue's book summed into price buckets (`bucket`, default about 1bp), with each level's size by venue. Venues trade at different levels, so the raw merge can look crossed; `adjusted=true` first moves each venue onto the composite's level.
+- `GET /api/v1/market/heatmap`: one column a second of the adjusted merged book, for up to 30 minutes (`seconds`, thinned by `step`). Each column is a price grid of 300 buckets centred on the composite price (bucket i is `low + i * bucket`), with bid and ask size per bucket. Venues lead and lag each other by about a basis point, more than any one venue's spread, so bids and asks overlap slightly near the price.
 - `GET /api/v1/market/tape`: recent trades from every venue, sizes in coins (contract venues are scaled by their contract size), paged by `after_seq`.
 - `snapshot`, `snapshot/batch`, `latest`, `universe`, `status` (each feed's state) and `health` (no token needed).
-- WebSocket `/api/ws?token=...`: send `{"event": "subscribe_symbols", "symbols": ["BTC-USD"]}` to receive `tick` every 250ms, new `tape` prints and `dom` every second.
+- WebSocket `/api/ws?token=...`: send `{"event": "subscribe_symbols", "symbols": ["BTC-USD"]}` to receive `tick` every 250ms, new `tape` prints, and `dom` and the newest `heatmap` column every second.
 
 The token comes from `PLOM_TOKEN`; without it the API is open. `PLOM_COINS`, `PLOM_VENUES` and `PORT` set the defaults for `--coins`, `--venues` and `--port`.
 

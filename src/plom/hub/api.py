@@ -12,7 +12,7 @@ import time
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 
 from plom.hub.runner import Hub
-from plom.hub.state import SymbolState
+from plom.hub.state import HEATMAP_LEVELS, HEATMAP_SECONDS, SymbolState
 
 TICK_EVERY_S = 0.25
 DOM_EVERY_TICKS = 4
@@ -57,7 +57,7 @@ def create_app(hub: Hub, token: str | None, start_hub: bool = True) -> FastAPI:
         return {
             "ok": True, "version": "v1", "venues": list(hub.venues),
             "ws": {"path": "/api/ws", "subscribe_event": "subscribe_symbols", "unsubscribe_event": "unsubscribe_symbols",
-                   "server_events": ["tick", "dom", "tape"], "tick_every_ms": TICK_EVERY_S * 1000},
+                   "server_events": ["tick", "dom", "tape", "heatmap"], "tick_every_ms": TICK_EVERY_S * 1000},
         }
 
     @app.get("/api/v1/status", dependencies=[Depends(auth)])
@@ -79,6 +79,11 @@ def create_app(hub: Hub, token: str | None, start_hub: bool = True) -> FastAPI:
     def dom(symbol: str, bucket: float | None = None, depth: int = Query(50, ge=1, le=500), adjusted: bool = False) -> dict:
         return state(symbol).dom(now_ms(), bucket, depth, adjusted)
 
+    @app.get("/api/v1/market/heatmap", dependencies=[Depends(auth)])
+    def heatmap(symbol: str, seconds: float = Query(300, gt=0, le=HEATMAP_SECONDS), step: int = Query(1, ge=1, le=60)) -> dict:
+        columns = state(symbol).heatmap_since(now_ms(), seconds, step)
+        return {"symbol": symbol.upper(), "levels": HEATMAP_LEVELS, "adjusted": True, "columns": [c.to_json() for c in columns]}
+
     @app.get("/api/v1/market/tape", dependencies=[Depends(auth)])
     def tape(symbol: str, after_seq: int = 0, limit: int = Query(200, ge=1, le=5000)) -> dict:
         prints = state(symbol).prints_after(after_seq, limit)
@@ -99,12 +104,13 @@ def create_app(hub: Hub, token: str | None, start_hub: bool = True) -> FastAPI:
             "tick": lambda: s.tick(now),
             "dom": lambda: s.dom(now),
             "tape": lambda: [p.to_json() for p in s.prints_after(0, 200)],
+            "heatmap": lambda: [c.to_json() for c in s.heatmap_since(now, 60)],
         }
         return {name: build() for name, build in parts.items() if name in include}
 
     @app.get("/api/v1/market/snapshot", dependencies=[Depends(auth)])
     def snapshot(symbol: str) -> dict:
-        return {"symbol": symbol.upper(), **snapshot_of(state(symbol), {"tick", "dom", "tape"})}
+        return {"symbol": symbol.upper(), **snapshot_of(state(symbol), {"tick", "dom", "tape", "heatmap"})}
 
     @app.get("/api/v1/market/snapshot/batch", dependencies=[Depends(auth)])
     def snapshot_batch(symbols: str, include: str = "tick") -> dict:
@@ -135,6 +141,7 @@ def create_app(hub: Hub, token: str | None, start_hub: bool = True) -> FastAPI:
 
         async def send() -> None:
             count = 0
+            last_column: dict[str, int] = {}
             while True:
                 await asyncio.sleep(TICK_EVERY_S)
                 now = now_ms()
@@ -147,6 +154,9 @@ def create_app(hub: Hub, token: str | None, start_hub: bool = True) -> FastAPI:
                         await socket.send_json({"event": "tape", "symbol": symbol, "data": [p.to_json() for p in prints]})
                     if count % DOM_EVERY_TICKS == 0:
                         await socket.send_json({"event": "dom", "data": s.dom(now)})
+                        if s.heatmap and s.heatmap[-1].ts_ms > last_column.get(symbol, 0):
+                            last_column[symbol] = s.heatmap[-1].ts_ms
+                            await socket.send_json({"event": "heatmap", "symbol": symbol, "data": s.heatmap[-1].to_json()})
                 count += 1
 
         tasks = [asyncio.create_task(receive()), asyncio.create_task(send())]

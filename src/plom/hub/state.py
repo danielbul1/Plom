@@ -9,12 +9,42 @@ from collections import deque
 from itertools import islice, takewhile
 from dataclasses import dataclass
 
+import numpy as np
+
 from plom import composite
 from plom.market import Book, Trade
 
 FRESH_MS = 5000
 """A venue whose last book is older than this is left out of prices and the merged book."""
 TAPE_SIZE = 5000
+HEATMAP_SECONDS = 1800
+"""How much heatmap history to keep, at one column a second."""
+HEATMAP_LEVELS = 150
+"""Buckets each side of the composite price in each heatmap column."""
+
+
+@dataclass(frozen=True)
+class Column:
+    """One second of the basis-adjusted merged book on a price grid centred on the composite price.
+
+    Bids and asks share the grid: bucket i is the price low + i * bucket. Venues lead and lag each
+    other by about a basis point, more than any one venue's spread, so their bids and asks overlap
+    a little near the price even after adjusting.
+    """
+
+    ts_ms: int
+    bucket: float
+    price: float
+    low: float
+    bids: np.ndarray
+    asks: np.ndarray
+
+    def to_json(self) -> dict:
+        size = lambda values: [float(f"{x:.6g}") for x in values]
+        return {
+            "ts_ms": self.ts_ms, "bucket": self.bucket, "price": self.price, "low": self.low,
+            "bids": size(self.bids), "asks": size(self.asks),
+        }
 
 
 @dataclass(frozen=True)
@@ -35,12 +65,13 @@ class Print:
 class SymbolState:
     def __init__(self, symbol: str, venues: tuple[str, ...]) -> None:
         self.symbol = symbol
-        self.composite = composite.Composite(tuple(v for v in composite.VENUES if v in venues))
+        self.composite = composite.Composite(venues)  # Every venue, so each gets a basis for the adjusted book.
         self.books: dict[str, tuple[float, Book]] = {}
         self.tape: deque[Print] = deque(maxlen=TAPE_SIZE)
         self.seq = 0
         self.price: float | None = None
         self.price_ms: float | None = None
+        self.heatmap: deque[Column] = deque(maxlen=HEATMAP_SECONDS)
 
     def on_book(self, venue: str, recv_ms: float, book: Book) -> None:
         if not book.bids or not book.asks:
@@ -95,6 +126,30 @@ class SymbolState:
             ordered = sorted(levels.items(), reverse=side == "bids")[:depth]
             sides[side] = [{"price": p, "size": sum(v.values()), "venues": v} for p, v in ordered]
         return {"symbol": self.symbol, "ts_ms": round(now_ms), "bucket": bucket, "adjusted": adjusted, "venues": sorted(fresh), **sides}
+
+    def sample_heatmap(self, now_ms: float) -> Column | None:
+        if self.price is None:
+            return None
+        dom = self.dom(now_ms, depth=HEATMAP_LEVELS, adjusted=True)
+        bucket = dom["bucket"]
+        low = round((math.floor(self.price / bucket) - HEATMAP_LEVELS) * bucket, 10)
+        sides = []
+        for side in ("bids", "asks"):
+            sizes = np.zeros(2 * HEATMAP_LEVELS, dtype=np.float32)
+            for level in dom[side]:
+                index = round((level["price"] - low) / bucket)
+                if 0 <= index < sizes.size:
+                    sizes[index] += level["size"]
+            sides.append(sizes)
+        column = Column(round(now_ms), bucket, self.price, low, *sides)
+        self.heatmap.append(column)
+        return column
+
+    def heatmap_since(self, now_ms: float, seconds: float, step: int = 1) -> list[Column]:
+        """Columns from the last `seconds`, oldest first, keeping every `step`-th counting back from the newest."""
+        since = now_ms - seconds * 1000
+        recent = list(takewhile(lambda c: c.ts_ms >= since, reversed(self.heatmap)))
+        return recent[::step][::-1]
 
     def prints_after(self, seq: int, limit: int = 500) -> list[Print]:
         """Trades with a sequence number above seq, oldest first, at most the newest `limit`."""
